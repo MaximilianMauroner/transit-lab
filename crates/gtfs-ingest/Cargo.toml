@@ -1,0 +1,18 @@
+[package]
+name = "gtfs-ingest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+csv.workspace = true
+serde.workspace = true
+sha2.workspace = true
+transit-domain = { path = "../transit-domain" }
+zip.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

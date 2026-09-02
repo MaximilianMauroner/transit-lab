@@ -1,0 +1,13 @@
+name: vertical-slice-v1
+feeds:
+  - vienna
+  - vbb
+origins: 32
+departure_times:
+  - "07:30"
+  - "08:30"
+  - "12:00"
+maximum_transfers: 4
+line_removals: selected-ten
+held_out_split: system-level
+

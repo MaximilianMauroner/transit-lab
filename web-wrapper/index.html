@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#09131f" />
+    <meta
+      name="description"
+      content="Explore line criticality predictions from Transit Lab."
+    />
+    <title>Transit Lab | Line impact</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="app-header">
+        <a class="brand" href="/" aria-label="Transit Lab home">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <span>Transit Lab</span>
+        </a>
+        <span class="header-tag">Line impact</span>
+      </header>
+
+      <main>
+        <section class="hero" aria-labelledby="page-title">
+          <p class="eyebrow">Counterfactual network analysis</p>
+          <h1 id="page-title">Find the lines your network cannot afford to lose.</h1>
+          <p class="hero-copy">
+            Load a prediction file or connect to an inference endpoint to explore
+            accessibility loss, delays, transfers, and structural uniqueness.
+          </p>
+        </section>
+
+        <section class="panel source-panel" aria-labelledby="source-title">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Data source</p>
+              <h2 id="source-title">Bring in a prediction run</h2>
+            </div>
+            <span id="source-status" class="status-pill">Waiting for data</span>
+          </div>
+
+          <div class="source-grid">
+            <label class="file-drop" for="file-input">
+              <span class="field-label">Prediction JSON file</span>
+              <span class="file-drop-main">
+                <span class="upload-icon" aria-hidden="true">↑</span>
+                <span>
+                  <strong>Choose a file</strong>
+                  <small id="file-name">JSON files only</small>
+                </span>
+              </span>
+              <input id="file-input" type="file" accept="application/json,.json" />
+            </label>
+
+            <form id="api-form" class="api-form">
+              <label class="field-label" for="api-url">Prediction API URL</label>
+              <div class="api-input-row">
+                <input
+                  id="api-url"
+                  name="api-url"
+                  type="url"
+                  inputmode="url"
+                  autocomplete="url"
+                  placeholder="http://localhost:3001/predictions"
+                />
+                <button class="button button-primary" type="submit">Load</button>
+              </div>
+              <small class="field-help">
+                The endpoint should return the same JSON shape as the Rust inference CLI.
+              </small>
+            </form>
+          </div>
+
+          <p id="source-message" class="source-message">
+            Nothing is loaded yet. Start with <code>data/demo/predictions.json</code> if you
+            have run the Rust demo.
+          </p>
+        </section>
+
+        <section id="dashboard" class="dashboard" aria-labelledby="dashboard-title" hidden>
+          <div class="section-heading dashboard-heading">
+            <div>
+              <p class="eyebrow">Snapshot overview</p>
+              <h2 id="dashboard-title">A quick read of this run</h2>
+            </div>
+            <code id="snapshot-id" class="snapshot-id">—</code>
+          </div>
+
+          <div class="stats-grid">
+            <article class="stat-card stat-card-accent">
+              <span class="stat-label">Lines ranked</span>
+              <strong id="stat-lines" class="stat-value">—</strong>
+              <span id="stat-lines-note" class="stat-note">—</span>
+            </article>
+            <article class="stat-card">
+              <span class="stat-label">Average accessibility loss</span>
+              <strong id="stat-average" class="stat-value">—</strong>
+              <span class="stat-note">Across all predicted lines</span>
+            </article>
+            <article class="stat-card">
+              <span class="stat-label">Highest predicted impact</span>
+              <strong id="stat-highest" class="stat-value">—</strong>
+              <span id="stat-highest-note" class="stat-note">—</span>
+            </article>
+          </div>
+        </section>
+
+        <section id="results-panel" class="panel results-panel" aria-labelledby="results-title" hidden>
+          <div class="section-heading results-heading">
+            <div>
+              <p class="eyebrow">Ranked lines</p>
+              <h2 id="results-title">Where a disruption matters most</h2>
+            </div>
+            <span id="result-count" class="result-count">0 lines</span>
+          </div>
+
+          <div class="controls" aria-label="Prediction filters">
+            <label class="control-field search-field" for="search-input">
+              <span class="field-label">Search lines</span>
+              <span class="input-with-icon">
+                <span aria-hidden="true">⌕</span>
+                <input
+                  id="search-input"
+                  type="search"
+                  autocomplete="off"
+                  placeholder="Line number or name"
+                />
+              </span>
+            </label>
+
+            <label class="control-field" for="sort-select">
+              <span class="field-label">Sort by</span>
+              <select id="sort-select">
+                <option value="accessibility_auc_loss">Accessibility loss</option>
+                <option value="unreachable_share">Unreachable share</option>
+                <option value="mean_delay_reachable_seconds">Mean delay</option>
+                <option value="structural_uniqueness">Structural uniqueness</option>
+                <option value="line">Line number</option>
+              </select>
+            </label>
+
+            <label class="control-field" for="impact-filter">
+              <span class="field-label">Show</span>
+              <select id="impact-filter">
+                <option value="all">All lines</option>
+                <option value="positive">Positive accessibility loss</option>
+                <option value="above-average">Above-average impact</option>
+              </select>
+            </label>
+          </div>
+
+          <div id="loading-state" class="state-card" role="status" aria-live="polite" hidden>
+            <span class="spinner" aria-hidden="true"></span>
+            <div>
+              <strong>Loading predictions</strong>
+              <p id="loading-message">Reading the selected source.</p>
+            </div>
+          </div>
+
+          <div id="error-state" class="state-card state-card-error" role="alert" hidden>
+            <span class="state-icon" aria-hidden="true">!</span>
+            <div>
+              <strong>Could not load predictions</strong>
+              <p id="error-message">Check the file and try again.</p>
+            </div>
+          </div>
+
+          <div id="empty-state" class="state-card state-card-empty" hidden>
+            <span class="state-icon" aria-hidden="true">∅</span>
+            <div>
+              <strong id="empty-title">No lines match these filters</strong>
+              <p id="empty-message">Try a different search or show all lines.</p>
+            </div>
+          </div>
+
+          <div id="list-container" class="list-container">
+            <div class="list-caption">
+              <span>Ranked by predicted accessibility loss</span>
+              <span>Tap a line for all metrics</span>
+            </div>
+            <ol id="prediction-list" class="prediction-list" aria-label="Line predictions"></ol>
+          </div>
+        </section>
+      </main>
+
+      <footer class="app-footer">
+        <span>Transit Lab</span>
+        <span>Predictions are estimates. Verify important decisions with the exact router.</span>
+      </footer>
+    </div>
+
+    <dialog id="line-dialog" class="line-dialog" aria-labelledby="dialog-title">
+      <div class="dialog-header">
+        <div>
+          <p class="eyebrow">Line detail</p>
+          <h2 id="dialog-title">Line</h2>
+          <p id="dialog-subtitle" class="dialog-subtitle">Predicted intervention impact</p>
+        </div>
+        <button id="dialog-close" class="icon-button" type="button" aria-label="Close line details">
+          ×
+        </button>
+      </div>
+      <div id="dialog-metrics" class="dialog-metrics"></div>
+      <p class="dialog-footnote">
+        Accessibility loss and share values are fractions in the source JSON and are shown as
+        percentages here. Delay values are seconds.
+      </p>
+    </dialog>
+
+    <script type="module" src="/src/app.js"></script>
+  </body>
+</html>

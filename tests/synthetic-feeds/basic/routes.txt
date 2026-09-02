@@ -1,0 +1,4 @@
+route_id,agency_id,route_short_name,route_long_name,route_type
+blue,agency,Blue,Blue trunk,1
+red,agency,Red,Red branch,3
+green,agency,Green,Green parallel,3

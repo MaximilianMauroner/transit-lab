@@ -1,0 +1,2 @@
+from_stop_id,to_stop_id,transfer_type,min_transfer_time
+platform_c,platform_d,2,120

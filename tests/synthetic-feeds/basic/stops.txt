@@ -1,0 +1,12 @@
+stop_id,stop_name,stop_lat,stop_lon,location_type,parent_station
+station_a,Alpha,48.1000,16.1000,1,
+platform_a1,Alpha,48.1000,16.1000,0,station_a
+platform_a2,Alpha,48.10005,16.10005,0,station_a
+station_b,Bravo,48.1010,16.1010,1,
+platform_b,Bravo,48.1010,16.1010,0,station_b
+station_c,Central,48.1020,16.1020,1,
+platform_c,Central,48.1020,16.1020,0,station_c
+station_d,Delta,48.1030,16.1030,1,
+platform_d,Delta,48.1030,16.1030,0,station_d
+station_e,Echo,48.1040,16.1040,1,
+platform_e,Echo,48.1040,16.1040,0,station_e

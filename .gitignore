@@ -1,0 +1,13 @@
+/target/
+/data/raw/
+/data/snapshots/
+/data/graphs/
+/data/labels/
+/data/runs/
+/data/models/
+/data/demo/
+/.agents/artifacts/
+/.agents/scratch/
+*.ot
+*.safetensors
+*.zip

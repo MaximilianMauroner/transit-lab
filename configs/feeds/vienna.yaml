@@ -1,0 +1,6 @@
+id: vienna
+display_name: Vienna GTFS
+landing_page: https://www.data.gv.at/datasets/ab4a73b6-1c2d-42e1-b4d9-049e04889cf0
+direct_download_url: https://www.wienerlinien.at/ogd_realtime/doku/ogd/gtfs/gtfs.zip
+geographical_scope: Vienna feed scope
+licence: See the data.gv.at dataset licence

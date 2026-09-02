@@ -1,0 +1,17 @@
+model:
+  hidden_dimension: 128
+  temporal_dimension: 32
+  graph_layers: 4
+  dropout: 0.15
+mask:
+  station_feature_probability: 0.30
+  line_feature_probability: 0.40
+  temporal_block_probability: 0.25
+  served_edge_probability: 0.10
+  transfer_edge_probability: 0.05
+  temporal_block_bins: 8
+steps: 50000
+learning_rate: 0.0003
+weight_decay: 0.00001
+seed: 7
+

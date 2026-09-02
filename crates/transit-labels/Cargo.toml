@@ -1,0 +1,16 @@
+[package]
+name = "transit-labels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+transit-domain = { path = "../transit-domain" }
+transit-router = { path = "../transit-router" }
+

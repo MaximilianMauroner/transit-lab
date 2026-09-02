@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#080b12" />
+    <meta
+      name="description"
+      content="Explore compiled GTFS networks as an interactive 3D graph."
+    />
+    <title>Transit Lab | 3D display</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <a class="brand" href="/" aria-label="Transit Lab display home">
+          <span class="brand-mark" aria-hidden="true"><i></i></span>
+          <span>Transit Lab <em>/ display</em></span>
+        </a>
+        <div class="topbar-meta">
+          <span class="live-dot" aria-hidden="true"></span>
+          <span>Graph viewer</span>
+          <code id="snapshot-chip">No snapshot</code>
+        </div>
+      </header>
+
+      <main>
+        <section class="intro" aria-labelledby="page-title">
+          <div>
+            <p class="eyebrow">Spatial GTFS explorer</p>
+            <h1 id="page-title">See how a transit network holds together.</h1>
+          </div>
+          <p class="intro-copy">
+            Orbit the network, isolate a line, and inspect the stations where service meets.
+            Height shows network activity, so the shape of each feed has a reason.
+          </p>
+        </section>
+
+        <section class="workspace" aria-label="3D graph workspace">
+          <aside class="panel sidebar" aria-label="Scene controls">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">Scene</p>
+                <h2>Build a view</h2>
+              </div>
+              <span id="data-status" class="status-pill">Waiting</span>
+            </div>
+
+            <div class="field-group">
+              <label class="field-label" for="snapshot-select">Snapshot</label>
+              <select id="snapshot-select" class="select-input">
+                <option value="">Loading local snapshots…</option>
+              </select>
+              <label class="upload-button" for="snapshot-file">
+                <span class="upload-symbol" aria-hidden="true">↑</span>
+                <span>
+                  <strong>Open snapshot folder</strong>
+                  <small>Choose a folder containing network.json</small>
+                </span>
+                <input id="snapshot-file" type="file" accept="application/json,.json" webkitdirectory />
+              </label>
+              <p id="file-name" class="field-help">Your files stay in this browser tab.</p>
+            </div>
+
+            <div class="rule"></div>
+
+            <div class="field-group">
+              <label class="field-label" for="node-search">Find a place or line</label>
+              <div class="search-box">
+                <span aria-hidden="true">⌕</span>
+                <input id="node-search" type="search" autocomplete="off" placeholder="Station or line name" />
+              </div>
+            </div>
+
+            <div class="control-grid">
+              <label class="field-label" for="height-select">Height by</label>
+              <select id="height-select" class="select-input">
+                <option value="connectivity">Network role</option>
+                <option value="departures">Daily departures</option>
+                <option value="service">Service span</option>
+              </select>
+            </div>
+
+            <div class="toggle-list" aria-label="Display options">
+              <label class="toggle-row">
+                <input id="stations-toggle" type="checkbox" checked />
+                <span class="toggle-track" aria-hidden="true"><i></i></span>
+                <span>Stations</span>
+              </label>
+              <label class="toggle-row">
+                <input id="transfers-toggle" type="checkbox" checked />
+                <span class="toggle-track" aria-hidden="true"><i></i></span>
+                <span>Transfer links</span>
+              </label>
+            </div>
+
+            <div class="rule"></div>
+
+            <div class="line-heading">
+              <span class="field-label">Visible lines</span>
+              <button id="all-lines-button" class="text-button" type="button">All</button>
+            </div>
+            <div id="mode-filters" class="mode-filters" aria-label="Transit type filters"></div>
+            <div id="line-list" class="line-list" aria-label="Visible lines"></div>
+
+            <div class="sidebar-actions">
+              <button id="reset-view" class="button button-secondary" type="button">Reset view</button>
+              <button id="top-view" class="button button-secondary" type="button">Top view</button>
+            </div>
+          </aside>
+
+          <section class="panel viewer-panel" aria-labelledby="viewer-title">
+            <div class="viewer-header">
+              <div>
+                <p class="eyebrow">3D network</p>
+                <h2 id="viewer-title">Drag to orbit</h2>
+              </div>
+              <div class="viewer-actions">
+                <span id="render-status" class="render-status">Waiting for data</span>
+                <button id="fullscreen-button" class="icon-button" type="button" aria-label="Enter fullscreen" title="Enter fullscreen">↗</button>
+              </div>
+            </div>
+            <div id="canvas-wrap" class="canvas-wrap">
+              <canvas id="graph-canvas" aria-label="Interactive 3D transit graph"></canvas>
+              <div class="canvas-grid" aria-hidden="true"></div>
+              <div class="canvas-hud canvas-hud-top">
+                <span class="axis-key"><i class="axis-dot axis-x"></i> east / west</span>
+                <span class="axis-key"><i class="axis-dot axis-z"></i> north / south</span>
+              </div>
+              <div class="canvas-hud canvas-hud-bottom">
+                <span><kbd>drag</kbd> orbit</span>
+                <span><kbd>scroll</kbd> zoom</span>
+              </div>
+              <div id="hover-card" class="hover-card" hidden></div>
+              <aside id="fullscreen-selection" class="fullscreen-selection" aria-live="polite" hidden>
+                <div class="fullscreen-selection-heading">
+                  <div>
+                    <p class="eyebrow">Selected</p>
+                    <h3 id="fullscreen-selection-title">Station</h3>
+                  </div>
+                  <button id="fullscreen-selection-close" class="icon-button" type="button" aria-label="Clear selection">×</button>
+                </div>
+                <div id="fullscreen-selection-content"></div>
+              </aside>
+              <div id="canvas-empty" class="canvas-empty">
+                <span class="empty-mark" aria-hidden="true">◎</span>
+                <strong>Load a compiled snapshot</strong>
+                <span>Run the demo or open any folder with a network.json file.</span>
+              </div>
+            </div>
+            <div class="legend" aria-label="Graph legend">
+              <span class="legend-label">Transit type</span>
+              <div id="mode-legend" class="mode-legend"></div>
+              <span><i class="legend-line legend-transfer"></i> transfer</span>
+              <span><i class="legend-node legend-interchange"></i> interchange</span>
+              <span class="legend-note">Node height follows <strong id="legend-height">network role</strong></span>
+            </div>
+          </section>
+
+          <aside class="panel inspector" aria-live="polite" aria-label="Selection details">
+            <div class="panel-heading inspector-heading">
+              <div>
+                <p class="eyebrow">Inspector</p>
+                <h2 id="inspector-title">Nothing selected</h2>
+              </div>
+              <button id="clear-selection" class="close-button" type="button" aria-label="Clear selection">×</button>
+            </div>
+            <div id="inspector-content" class="inspector-content">
+              <div class="inspector-empty">
+                <span class="selection-icon" aria-hidden="true">+</span>
+                <p>Click a station or line to see the data behind it.</p>
+              </div>
+            </div>
+          </aside>
+        </section>
+
+        <section class="network-summary" aria-label="Network summary">
+          <div class="summary-intro">
+            <p class="eyebrow">Snapshot readout</p>
+            <h2 id="summary-title">No network loaded</h2>
+            <p id="summary-copy">A compiled snapshot turns GTFS tables into places, routes, and connections you can inspect together.</p>
+          </div>
+          <div class="summary-stats">
+            <div class="summary-stat"><span>Stations</span><strong id="stat-stations">—</strong></div>
+            <div class="summary-stat"><span>Lines</span><strong id="stat-lines">—</strong></div>
+            <div class="summary-stat"><span>Route links</span><strong id="stat-edges">—</strong></div>
+            <div class="summary-stat"><span>Interchanges</span><strong id="stat-interchanges">—</strong></div>
+          </div>
+        </section>
+      </main>
+
+      <footer class="app-footer">
+        <span>Transit Lab / display</span>
+        <span>Compiled snapshot data is read locally. No feed is uploaded.</span>
+      </footer>
+    </div>
+
+    <script type="module" src="/src/app.js"></script>
+  </body>
+</html>

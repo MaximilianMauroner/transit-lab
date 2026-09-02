@@ -1,0 +1,30 @@
+[package]
+name = "transit-training"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+tch-backend = ["transit-model/tch-backend", "dep:tch"]
+tch-doc-only = ["tch-backend", "transit-model/tch-doc-only", "tch/doc-only"]
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+transit-domain = { path = "../transit-domain" }
+transit-graph = { path = "../transit-graph" }
+transit-labels = { path = "../transit-labels" }
+transit-model = { path = "../transit-model" }
+tch = { version = "0.18", optional = true }
+
+[dev-dependencies]
+gtfs-compile = { path = "../gtfs-compile" }
+gtfs-ingest = { path = "../gtfs-ingest" }
+tempfile.workspace = true
+transit-router = { path = "../transit-router" }
+transit-search = { path = "../transit-search" }

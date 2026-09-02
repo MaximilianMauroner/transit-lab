@@ -1,0 +1,5 @@
+route_id,service_id,trip_id,direction_id
+blue,weekday,blue-1,0
+blue,weekday,blue-2,0
+red,weekday,red-1,0
+green,weekday,green-1,0

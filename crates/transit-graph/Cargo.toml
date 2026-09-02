@@ -1,0 +1,19 @@
+[package]
+name = "transit-graph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+half.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+gtfs-compile = { path = "../gtfs-compile" }
+transit-domain = { path = "../transit-domain" }
+
+[dev-dependencies]
+chrono.workspace = true
+gtfs-ingest = { path = "../gtfs-ingest" }
+tempfile.workspace = true

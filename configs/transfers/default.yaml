@@ -1,0 +1,7 @@
+version: explicit-transfers-pathways-conservative-inference-v1
+station_merge_radius_metres: 150
+exact_name_radius_metres: 150
+fuzzy_name_radius_metres: 90
+fuzzy_similarity_threshold: 0.92
+shape_crossings_create_transfers: false
+

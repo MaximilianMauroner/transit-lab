@@ -1,0 +1,4 @@
+name: vienna-feed-scope
+description: Preserve the official Vienna feed scope; do not clip by city boundary implicitly.
+geometry: null
+

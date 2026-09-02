@@ -1,0 +1,24 @@
+[package]
+name = "transit-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+transit-dataset = { path = "../transit-dataset" }
+transit-domain = { path = "../transit-domain" }
+gtfs-compile = { path = "../gtfs-compile" }
+gtfs-ingest = { path = "../gtfs-ingest" }
+gtfs-source = { path = "../gtfs-source" }
+transit-graph = { path = "../transit-graph" }
+transit-inference = { path = "../transit-inference" }
+transit-labels = { path = "../transit-labels" }
+transit-model = { path = "../transit-model" }
+transit-router = { path = "../transit-router" }
+transit-search = { path = "../transit-search" }
+transit-training = { path = "../transit-training" }
