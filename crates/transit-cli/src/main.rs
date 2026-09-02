@@ -26,9 +26,10 @@ use transit_model::{
 use transit_router::{Router, RouterConfig};
 use transit_search::{rank_similar_lines, SimilarityProfile};
 use transit_training::{
-    load_checkpoint, load_config, save_checkpoint, train_criticality_head,
-    train_reference_autoencoder, train_reference_multitask, CriticalityTrainingConfig,
-    MultiTaskTrainingConfig, PretrainingConfig, ReferenceCheckpoint,
+    load_checkpoint, load_config, save_checkpoint, train_criticality_head_with_observer,
+    train_reference_autoencoder_with_observer, train_reference_multitask_with_observer,
+    CriticalityTrainingConfig, MultiTaskTrainingConfig, PretrainingConfig, ReferenceCheckpoint,
+    TrainingObserver,
 };
 
 #[derive(Debug, Parser)]
@@ -160,6 +161,8 @@ struct PretrainArgs {
     config: Option<PathBuf>,
     #[arg(long)]
     output: PathBuf,
+    #[arg(long)]
+    seed: Option<u64>,
 }
 
 #[derive(Debug, Args)]
@@ -174,6 +177,8 @@ struct CriticalityArgs {
     output: PathBuf,
     #[arg(long)]
     config: Option<PathBuf>,
+    #[arg(long)]
+    seed: Option<u64>,
 }
 
 #[derive(Debug, Args)]
@@ -190,6 +195,8 @@ struct MultiTaskArgs {
     config: Option<PathBuf>,
     #[arg(long)]
     output: PathBuf,
+    #[arg(long)]
+    seed: Option<u64>,
 }
 
 #[derive(Debug, Args)]
@@ -450,13 +457,18 @@ fn command_labels(args: LabelsArgs) -> Result<()> {
 
 fn command_pretrain(args: PretrainArgs) -> Result<()> {
     let graph = GraphTensor::load(&args.graph)?;
-    let config = args
+    let mut config = args
         .config
         .as_deref()
         .map(load_config::<PretrainingConfig>)
         .transpose()?
         .unwrap_or_default();
-    let (encoder, report) = train_reference_autoencoder(&graph, &config)?;
+    if let Some(seed) = args.seed {
+        config.seed = seed;
+    }
+    let mut observer = JsonlTrainingObserver;
+    let (encoder, report) =
+        train_reference_autoencoder_with_observer(&graph, &config, &mut observer)?;
     save_checkpoint(
         &args.output,
         &ReferenceCheckpoint {
@@ -464,9 +476,12 @@ fn command_pretrain(args: PretrainArgs) -> Result<()> {
             head: None,
             report: Some(report.clone()),
             representation: None,
+            config_fingerprint: None,
+            seed: Some(config.seed),
         },
     )?;
     write_artifact_manifest(&args.output, "model-checkpoint")?;
+    emit_checkpoint_created(&args.output, "pretraining", config.steps, config.steps)?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
@@ -475,13 +490,23 @@ fn command_criticality(args: CriticalityArgs) -> Result<()> {
     let graph = GraphTensor::load(&args.graph)?;
     let labels = transit_labels::load_jsonl(&args.labels)?;
     let checkpoint = load_checkpoint(&args.encoder)?;
-    let config = args
+    let mut config = args
         .config
         .as_deref()
         .map(load_config::<CriticalityTrainingConfig>)
         .transpose()?
         .unwrap_or_default();
-    let (head, report) = train_criticality_head(&checkpoint.encoder, &graph, &labels, &config)?;
+    if let Some(seed) = args.seed {
+        config.seed = seed;
+    }
+    let mut observer = JsonlTrainingObserver;
+    let (head, report) = train_criticality_head_with_observer(
+        &checkpoint.encoder,
+        &graph,
+        &labels,
+        &config,
+        &mut observer,
+    )?;
     save_checkpoint(
         &args.output,
         &ReferenceCheckpoint {
@@ -489,23 +514,64 @@ fn command_criticality(args: CriticalityArgs) -> Result<()> {
             head: Some(head),
             report: Some(report.clone()),
             representation: checkpoint.representation,
+            config_fingerprint: None,
+            seed: Some(config.seed),
         },
     )?;
     write_artifact_manifest(&args.output, "model-checkpoint")?;
+    emit_checkpoint_created(&args.output, "criticality", config.epochs, config.epochs)?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
+}
+
+fn load_multitask_config(
+    path: Option<&Path>,
+) -> Result<(MultiTaskTrainingConfig, Option<String>, Option<u64>)> {
+    let Some(path) = path else {
+        return Ok((MultiTaskTrainingConfig::default(), None, None));
+    };
+    if matches!(
+        path.extension().and_then(|extension| extension.to_str()),
+        Some("yaml") | Some("yml")
+    ) {
+        return Ok((load_config(path)?, None, None));
+    }
+    let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let value: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("decoding JSON config {}", path.display()))?;
+    let Some(model_config) = value.get("modelConfig") else {
+        return Ok((load_config(path)?, None, None));
+    };
+    let fingerprint = value
+        .get("configFingerprint")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let seed = value.get("seed").and_then(Value::as_u64);
+    let config = serde_json::from_value(model_config.clone())
+        .context("decoding resolved multitask model config")?;
+    Ok((config, fingerprint, seed))
+}
+
+fn set_multitask_seed(config: &mut MultiTaskTrainingConfig, seed: u64) {
+    config.pretraining.seed = seed;
+    config.representation.seed = seed;
+    config.criticality.seed = seed;
 }
 
 fn command_multitask(args: MultiTaskArgs) -> Result<()> {
     if args.labels.len() > args.graphs.len() {
         bail!("provide at most one --labels file for each --graph");
     }
-    let config = args
-        .config
-        .as_deref()
-        .map(load_config::<MultiTaskTrainingConfig>)
-        .transpose()?
-        .unwrap_or_default();
+    let (mut config, config_fingerprint, declared_seed) =
+        load_multitask_config(args.config.as_deref())?;
+    if let (Some(declared), Some(requested)) = (declared_seed, args.seed) {
+        if declared != requested {
+            bail!("--seed {requested} does not match the resolved config seed {declared}");
+        }
+    }
+    if let Some(seed) = args.seed {
+        set_multitask_seed(&mut config, seed);
+    }
     let graphs: Vec<GraphTensor> = args
         .graphs
         .iter()
@@ -526,9 +592,22 @@ fn command_multitask(args: MultiTaskArgs) -> Result<()> {
         .zip(&labels)
         .map(|(graph, labels)| (graph, labels.as_slice()))
         .collect();
-    let (checkpoint, report) = train_reference_multitask(&datasets, &config)?;
+    let mut observer = JsonlTrainingObserver;
+    let (checkpoint, report) =
+        train_reference_multitask_with_observer(&datasets, &config, &mut observer)?;
+    let checkpoint = ReferenceCheckpoint {
+        config_fingerprint,
+        seed: Some(args.seed.unwrap_or(config.pretraining.seed)),
+        ..checkpoint
+    };
     save_checkpoint(&args.output, &checkpoint)?;
     write_artifact_manifest(&args.output, "model-checkpoint")?;
+    emit_checkpoint_created(
+        &args.output,
+        "criticality",
+        config.criticality.epochs,
+        config.criticality.epochs,
+    )?;
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
@@ -781,8 +860,10 @@ fn command_demo(args: DemoArgs) -> Result<()> {
         steps: 25,
         ..PretrainingConfig::default()
     };
-    let (encoder, pretrain_report) = train_reference_autoencoder(&graph, &pretraining)?;
-    let (head, head_report) = train_criticality_head(
+    let mut observer = JsonlTrainingObserver;
+    let (encoder, pretrain_report) =
+        train_reference_autoencoder_with_observer(&graph, &pretraining, &mut observer)?;
+    let (head, head_report) = transit_training::train_criticality_head_with_observer(
         &encoder,
         &graph,
         &labels,
@@ -790,6 +871,7 @@ fn command_demo(args: DemoArgs) -> Result<()> {
             epochs: 20,
             ..CriticalityTrainingConfig::default()
         },
+        &mut observer,
     )?;
     let checkpoint_path = args.output.join("model.json");
     save_checkpoint(
@@ -799,9 +881,12 @@ fn command_demo(args: DemoArgs) -> Result<()> {
             head: Some(head),
             report: Some(head_report.clone()),
             representation: None,
+            config_fingerprint: None,
+            seed: Some(pretraining.seed),
         },
     )?;
     write_artifact_manifest(&checkpoint_path, "model-checkpoint")?;
+    emit_checkpoint_created(&checkpoint_path, "criticality", 20, 20)?;
     let mut predictions = predict_reference(&load_checkpoint(&checkpoint_path)?, &graph)?;
     predictions.model_id = Some("model-demo-reference".into());
     rank_by_accessibility(&mut predictions);
@@ -833,6 +918,60 @@ fn source_metadata_path(input: &std::path::Path) -> Option<PathBuf> {
 }
 
 static RUNTIME_EVENT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+struct JsonlTrainingObserver;
+
+impl TrainingObserver for JsonlTrainingObserver {
+    fn phase_started(&mut self, phase: &str, total: Option<usize>) {
+        let mut payload = serde_json::Map::new();
+        payload.insert("phase".into(), json!(phase));
+        if let Some(total) = total {
+            payload.insert("total".into(), json!(total));
+        }
+        let _ = emit_runtime_event("phase.started", Value::Object(payload));
+    }
+
+    fn epoch_started(&mut self, phase: &str, epoch: usize, total: usize) {
+        let _ = emit_runtime_event(
+            "epoch.started",
+            json!({"phase": phase, "epoch": epoch, "total": total}),
+        );
+    }
+
+    fn metric(&mut self, phase: &str, epoch: usize, step: usize, name: &str, value: f32) {
+        let _ = emit_runtime_event(
+            "metric",
+            json!({"phase": phase, "epoch": epoch, "step": step, "name": name, "value": value}),
+        );
+    }
+
+    fn learning_rate_changed(&mut self, phase: &str, step: usize, value: f32) {
+        let _ = emit_runtime_event(
+            "learning-rate.changed",
+            json!({"phase": phase, "step": step, "value": value}),
+        );
+    }
+
+    fn heartbeat(&mut self, phase: &str, step: usize) {
+        let _ = emit_runtime_event("heartbeat", json!({"phase": phase, "step": step}));
+    }
+
+    fn phase_completed(&mut self, phase: &str) {
+        let _ = emit_runtime_event("phase.completed", json!({"phase": phase}));
+    }
+}
+
+fn emit_checkpoint_created(path: &Path, phase: &str, epoch: usize, step: usize) -> Result<()> {
+    emit_runtime_event(
+        "checkpoint.created",
+        json!({
+            "phase": phase,
+            "epoch": epoch,
+            "step": step,
+            "path": path.to_string_lossy()
+        }),
+    )
+}
 
 /// Emit machine-readable events only when the Studio worker opts into the
 /// protocol. Human stdout remains a separate diagnostic stream.
@@ -954,7 +1093,11 @@ fn write_artifact_manifest(output: &Path, kind: &str) -> Result<()> {
         "producingRunId": std::env::var("TRANSIT_RUN_ID").ok(),
         "inputs": [],
         "gitCommit": std::env::var("TRANSIT_LAB_GIT_COMMIT").unwrap_or_else(|_| "working-tree".into()),
-        "configuration": {"producer": "transit-cli", "kind": kind},
+        "configuration": {
+            "producer": "transit-cli",
+            "kind": kind,
+            "configFingerprint": std::env::var("TRANSIT_CONFIG_FINGERPRINT").ok()
+        },
         "files": files,
         "metadata": {}
     });

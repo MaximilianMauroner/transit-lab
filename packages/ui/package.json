@@ -1,0 +1,19 @@
+{
+  "name": "@transit-lab/ui",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./table": "./src/table.ts"
+  },
+  "dependencies": {
+    "@transit-lab/api-client": "workspace:*"
+  },
+  "scripts": {
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.2"
+  }
+}

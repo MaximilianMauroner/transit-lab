@@ -4,6 +4,35 @@
   "workspaces": {
     "": {
       "name": "transit-lab-control-plane",
+      "devDependencies": {
+        "bun-types": "^1.3.0",
+        "typescript": "^5.9.2",
+      },
+    },
+    "apps/api": {
+      "name": "@transit-lab/api",
+      "version": "0.1.0",
+      "dependencies": {
+        "@transit-lab/contracts": "workspace:*",
+        "@transit-lab/control-store": "workspace:*",
+      },
+      "devDependencies": {
+        "bun-types": "^1.3.0",
+        "typescript": "^5.9.2",
+      },
+    },
+    "apps/explorer": {
+      "name": "@transit-lab/explorer",
+      "version": "0.1.0",
+      "dependencies": {
+        "@transit-lab/api-client": "workspace:*",
+        "@transit-lab/ui": "workspace:*",
+        "@transit-lab/visualizations": "workspace:*",
+      },
+      "devDependencies": {
+        "bun-types": "^1.3.0",
+        "typescript": "^5.9.2",
+      },
     },
     "apps/studio": {
       "name": "@transit-lab/studio",
@@ -16,15 +45,80 @@
         "typescript": "^5.9.2",
       },
     },
+    "apps/worker": {
+      "name": "@transit-lab/worker",
+      "version": "0.1.0",
+      "dependencies": {
+        "@transit-lab/contracts": "workspace:*",
+        "@transit-lab/control-store": "workspace:*",
+      },
+      "devDependencies": {
+        "bun-types": "^1.3.0",
+        "typescript": "^5.9.2",
+      },
+    },
+    "packages/api-client": {
+      "name": "@transit-lab/api-client",
+      "version": "0.1.0",
+      "devDependencies": {
+        "typescript": "^5.9.2",
+      },
+    },
     "packages/contracts": {
       "name": "@transit-lab/contracts",
       "version": "0.1.0",
+      "devDependencies": {
+        "bun-types": "^1.3.0",
+        "typescript": "^5.9.2",
+      },
+    },
+    "packages/control-store": {
+      "name": "@transit-lab/control-store",
+      "version": "0.1.0",
+      "dependencies": {
+        "@transit-lab/contracts": "workspace:*",
+      },
+      "devDependencies": {
+        "bun-types": "^1.3.0",
+        "typescript": "^5.9.2",
+      },
+    },
+    "packages/ui": {
+      "name": "@transit-lab/ui",
+      "version": "0.1.0",
+      "dependencies": {
+        "@transit-lab/api-client": "workspace:*",
+      },
+      "devDependencies": {
+        "typescript": "^5.9.2",
+      },
+    },
+    "packages/visualizations": {
+      "name": "@transit-lab/visualizations",
+      "version": "0.1.0",
+      "devDependencies": {
+        "typescript": "^5.9.2",
+      },
     },
   },
   "packages": {
+    "@transit-lab/api": ["@transit-lab/api@workspace:apps/api"],
+
+    "@transit-lab/api-client": ["@transit-lab/api-client@workspace:packages/api-client"],
+
     "@transit-lab/contracts": ["@transit-lab/contracts@workspace:packages/contracts"],
 
+    "@transit-lab/control-store": ["@transit-lab/control-store@workspace:packages/control-store"],
+
+    "@transit-lab/explorer": ["@transit-lab/explorer@workspace:apps/explorer"],
+
     "@transit-lab/studio": ["@transit-lab/studio@workspace:apps/studio"],
+
+    "@transit-lab/ui": ["@transit-lab/ui@workspace:packages/ui"],
+
+    "@transit-lab/visualizations": ["@transit-lab/visualizations@workspace:packages/visualizations"],
+
+    "@transit-lab/worker": ["@transit-lab/worker@workspace:apps/worker"],
 
     "@types/node": ["@types/node@26.4.1", "", { "dependencies": { "undici-types": "~8.3.0" } }, "sha512-k97ENvZWtvA6yqz5/FS6a7duDgOPEeOQOc2iKS/nY6mX6qJUKtLnWzQS+Xj6tXweyj6ZcTAK2Qecetnvi9nCLA=="],
 

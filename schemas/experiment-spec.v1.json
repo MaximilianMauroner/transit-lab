@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://transit-lab.local/schemas/experiment-spec.v1.json",
+  "title": "Transit Lab experiment specification v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "datasetId", "modelConfig", "seed", "runtime"],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "datasetId": {"type": "string", "minLength": 1},
+    "modelConfig": {
+      "oneOf": [
+        {"type": "string", "pattern": "^(?!/)(?!.*(?:^|[/\\])\\.\\.(?:[/\\]|$)).+\\.(?:json|ya?ml)$"},
+        {"type": "object"}
+      ]
+    },
+    "seed": {"type": "integer", "minimum": 0, "maximum": 2147483647},
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["device", "precision", "checkpointInterval", "metricInterval", "workerThreads"],
+      "properties": {
+        "device": {"type": "string", "minLength": 1},
+        "precision": {"enum": ["fp32", "fp16", "bf16"]},
+        "checkpointInterval": {"type": "integer", "minimum": 1},
+        "metricInterval": {"type": "integer", "minimum": 1},
+        "workerThreads": {"type": "integer", "minimum": 1}
+      }
+    }
+  }
+}

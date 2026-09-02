@@ -11,10 +11,10 @@
     "typescript": "^5.9.2"
   },
   "scripts": {
-    "dev": "bun --hot src/server/index.js",
-    "worker": "bun src/worker/index.js",
+    "dev": "bun --hot src/server/index.ts",
+    "start": "bun src/server/index.ts",
     "test": "bun test test",
     "check": "tsc --noEmit",
-    "build": "bun run src/client/build.js"
+    "build": "bun run src/client/build.ts"
   }
 }

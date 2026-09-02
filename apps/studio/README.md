@@ -14,27 +14,26 @@ The shipped routes are `/`, `/data`, `/runs`, `/network`, `/criticality`,
 available from `/data`.
 
 The current run form submits simulation and inference operations. Dataset and
-evaluation views remain read-only until the Rust CLI exposes versioned
-`build-dataset` and `evaluate` commands; the worker rejects those unsupported
-kinds explicitly.
+evaluation views display indexed Rust outputs. The worker rejects run kinds
+that do not have an allow-listed Rust command.
 
 ## Run locally
 
 From the repository root:
 
 ```bash
-TRANSIT_LAB_ROOT="$PWD" bun run apps/studio/src/server/index.js
+TRANSIT_LAB_ROOT="$PWD" bun run apps/studio/src/server/index.ts
 ```
 
-In a second terminal, start the allow-listed Rust worker:
+In another terminal, start the control API and allow-listed Rust worker:
 
 ```bash
-TRANSIT_LAB_ROOT="$PWD" bun run apps/studio/src/worker/index.js
+TRANSIT_LAB_ROOT="$PWD" bun run apps/api/src/index.ts
+TRANSIT_LAB_ROOT="$PWD" bun run apps/worker/src/index.ts
 ```
 
-The server defaults to `http://localhost:3000`. Configure the repository and
-artifact locations with `TRANSIT_LAB_ROOT`, `TRANSIT_LAB_DATA_DIR`,
-`TRANSIT_LAB_BINARY`, and `TRANSIT_LAB_DB`.
-
-Legacy `display/` and `web-wrapper/` remain available while `/network` and
-`/criticality` reach parity. They are not additional Studio data sources.
+Studio defaults to `http://localhost:3000` and proxies `/api/control` to the
+control API. Configure repository and artifact locations with
+`TRANSIT_LAB_ROOT`, `TRANSIT_LAB_DATA_DIR`, `TRANSIT_LAB_BINARY`, and
+`TRANSIT_LAB_DB`. Run `bun run db:push` to push the control-store schema
+explicitly. Startup repeats the same idempotent push for local databases.

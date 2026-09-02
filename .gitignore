@@ -8,7 +8,10 @@ node_modules/
 /data/models/
 data/*.sqlite
 /data/demo/
+/data/publications/
 /apps/studio/public/dist/
+/apps/explorer/public/dist/
+transit-lab-smoke.*/
 /.agents/artifacts/
 /.agents/scratch/
 *.ot

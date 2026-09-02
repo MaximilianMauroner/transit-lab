@@ -4,17 +4,28 @@
   "private": true,
   "type": "module",
   "workspaces": [
-    "apps/studio",
+    "apps/*",
     "packages/*"
   ],
   "scripts": {
-    "dev": "bun run apps/studio/src/server/index.js",
-    "studio": "bun run apps/studio/src/server/index.js",
-    "worker": "bun run apps/studio/src/worker/index.js",
-    "studio:worker": "bun run apps/studio/src/worker/index.js",
-    "worker:once": "bun run apps/studio/src/worker/index.js --once",
-    "build": "bun run apps/studio/src/client/build.js",
-    "test": "bun test apps/studio packages display web-wrapper",
-    "check": "bun run --cwd apps/studio check"
+    "dev": "bun run apps/studio/src/server/index.ts",
+    "api": "bun run apps/api/src/index.ts",
+    "studio": "bun run apps/studio/src/server/index.ts",
+    "explorer": "bun run apps/explorer/src/server/index.ts",
+    "worker": "bun run apps/worker/src/index.ts",
+    "studio:worker": "bun run apps/worker/src/index.ts",
+    "worker:once": "bun run apps/worker/src/index.ts --once",
+    "db:push": "bun run --cwd packages/control-store db:push",
+    "build": "bun run build:studio && bun run build:explorer",
+    "build:studio": "bun run apps/studio/src/client/build.ts",
+    "build:explorer": "bun run apps/explorer/src/build.ts",
+    "test": "bun test apps/api apps/studio apps/worker packages",
+    "check": "bun run check:apps && bun run check:packages",
+    "check:apps": "bun run --cwd apps/api check && bun run --cwd apps/studio check && bun run --cwd apps/explorer check && bun run --cwd apps/worker check",
+    "check:packages": "bun run --cwd packages/contracts check && bun run --cwd packages/control-store check && bun run --cwd packages/api-client check && bun run --cwd packages/ui check && bun run --cwd packages/visualizations check"
+  },
+  "devDependencies": {
+    "bun-types": "^1.3.0",
+    "typescript": "^5.9.2"
   }
 }

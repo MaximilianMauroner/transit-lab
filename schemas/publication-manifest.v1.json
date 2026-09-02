@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://transit-lab.local/schemas/publication-manifest.v1.json",
+  "title": "Transit Lab immutable publication bundle v1",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schemaVersion", "publicationId", "slug", "title", "createdAt", "snapshotIds", "modelIds", "artifactIds", "entries", "files"],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "publicationId": {"type": "string", "minLength": 1},
+    "slug": {"type": "string", "minLength": 1},
+    "title": {"type": "string", "minLength": 1},
+    "createdAt": {"type": "string", "format": "date-time"},
+    "snapshotIds": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "modelIds": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "artifactIds": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "entries": {"type": "object"},
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "sizeBytes", "sha256"],
+        "properties": {
+          "path": {"type": "string", "minLength": 1},
+          "sizeBytes": {"type": "integer", "minimum": 0},
+          "sha256": {"type": "string", "pattern": "^[A-Fa-f0-9]{64}$"}
+        }
+      }
+    }
+  }
+}

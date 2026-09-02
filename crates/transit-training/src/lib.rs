@@ -18,6 +18,24 @@ use transit_model::{
     CRITICALITY_OUTPUTS,
 };
 
+/// Semantic observations emitted by the training engine. The engine knows
+/// about phases and metrics, but not about JSONL files, Bun, SQLite, or HTTP.
+/// Implementations may forward these callbacks to a CLI, a test collector, or
+/// a future native service.
+pub trait TrainingObserver {
+    fn phase_started(&mut self, _phase: &str, _total: Option<usize>) {}
+    fn epoch_started(&mut self, _phase: &str, _epoch: usize, _total: usize) {}
+    fn metric(&mut self, _phase: &str, _epoch: usize, _step: usize, _name: &str, _value: f32) {}
+    fn learning_rate_changed(&mut self, _phase: &str, _step: usize, _value: f32) {}
+    fn heartbeat(&mut self, _phase: &str, _step: usize) {}
+    fn phase_completed(&mut self, _phase: &str) {}
+}
+
+#[derive(Default)]
+pub struct NoopTrainingObserver;
+
+impl TrainingObserver for NoopTrainingObserver {}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PretrainingConfig {
     pub model: ModelConfig,
@@ -109,6 +127,12 @@ pub struct ReferenceCheckpoint {
     pub report: Option<TrainingReport>,
     #[serde(default)]
     pub representation: Option<TrainableLineRepresentationModel>,
+    /// Fingerprint of the immutable resolved experiment configuration that
+    /// produced this checkpoint. Old checkpoints may not carry one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -143,10 +167,22 @@ pub fn train_reference_autoencoder(
     graph: &GraphTensor,
     config: &PretrainingConfig,
 ) -> Result<(ReferenceRelationalAutoencoder, TrainingReport)> {
+    let mut observer = NoopTrainingObserver;
+    train_reference_autoencoder_with_observer(graph, config, &mut observer)
+}
+
+pub fn train_reference_autoencoder_with_observer(
+    graph: &GraphTensor,
+    config: &PretrainingConfig,
+    observer: &mut dyn TrainingObserver,
+) -> Result<(ReferenceRelationalAutoencoder, TrainingReport)> {
     let mut model = ReferenceRelationalAutoencoder::new(config.model.clone());
     let mut initial_loss = 0.0;
     let mut final_loss = 0.0;
+    observer.phase_started("pretraining", Some(config.steps));
+    observer.learning_rate_changed("pretraining", 0, config.learning_rate);
     for step in 0..config.steps {
+        observer.epoch_started("pretraining", step + 1, config.steps);
         let mask =
             MaskSelection::sample(graph, &config.mask, config.seed.wrapping_add(step as u64));
         let loss = model.train_decoder_step(graph, &mask, config.learning_rate)?;
@@ -158,7 +194,18 @@ pub fn train_reference_autoencoder(
         // backend. The reference decoder intentionally keeps its update loop
         // small; retaining the config field preserves checkpoint compatibility.
         let _ = config.weight_decay;
+        observer.metric(
+            "pretraining",
+            step + 1,
+            step + 1,
+            "reconstruction_loss",
+            loss,
+        );
+        if step % 10 == 0 || step + 1 == config.steps {
+            observer.heartbeat("pretraining", step + 1);
+        }
     }
+    observer.phase_completed("pretraining");
     Ok((
         model,
         TrainingReport {
@@ -177,6 +224,15 @@ pub fn train_reference_autoencoder_multi(
     graphs: &[&GraphTensor],
     config: &PretrainingConfig,
 ) -> Result<(ReferenceRelationalAutoencoder, TrainingReport)> {
+    let mut observer = NoopTrainingObserver;
+    train_reference_autoencoder_multi_with_observer(graphs, config, &mut observer)
+}
+
+pub fn train_reference_autoencoder_multi_with_observer(
+    graphs: &[&GraphTensor],
+    config: &PretrainingConfig,
+    observer: &mut dyn TrainingObserver,
+) -> Result<(ReferenceRelationalAutoencoder, TrainingReport)> {
     let Some(first_graph) = graphs.first() else {
         anyhow::bail!("no graph datasets were provided");
     };
@@ -193,7 +249,10 @@ pub fn train_reference_autoencoder_multi(
     let mut model = ReferenceRelationalAutoencoder::new(config.model.clone());
     let mut initial_loss = 0.0;
     let mut final_loss = 0.0;
+    observer.phase_started("pretraining", Some(config.steps));
+    observer.learning_rate_changed("pretraining", 0, config.learning_rate);
     for step in 0..config.steps {
+        observer.epoch_started("pretraining", step + 1, config.steps);
         let graph = graphs[step % graphs.len()];
         let mask = MaskSelection::sample(
             graph,
@@ -208,7 +267,18 @@ pub fn train_reference_autoencoder_multi(
             initial_loss = loss;
         }
         final_loss = loss;
+        observer.metric(
+            "pretraining",
+            step + 1,
+            step + 1,
+            "reconstruction_loss",
+            loss,
+        );
+        if step % 10 == 0 || step + 1 == config.steps {
+            observer.heartbeat("pretraining", step + 1);
+        }
     }
+    observer.phase_completed("pretraining");
     Ok((
         model,
         TrainingReport {
@@ -243,7 +313,18 @@ pub fn train_criticality_head(
     labels: &[LineImpactLabel],
     config: &CriticalityTrainingConfig,
 ) -> Result<(CriticalityHead, TrainingReport)> {
-    train_criticality_head_multi(encoder, &[(graph, labels)], config)
+    let mut observer = NoopTrainingObserver;
+    train_criticality_head_with_observer(encoder, graph, labels, config, &mut observer)
+}
+
+pub fn train_criticality_head_with_observer(
+    encoder: &ReferenceRelationalAutoencoder,
+    graph: &GraphTensor,
+    labels: &[LineImpactLabel],
+    config: &CriticalityTrainingConfig,
+    observer: &mut dyn TrainingObserver,
+) -> Result<(CriticalityHead, TrainingReport)> {
+    train_criticality_head_multi_with_observer(encoder, &[(graph, labels)], config, observer)
 }
 
 /// Train one shared head over several city/snapshot graphs. Each graph is
@@ -253,6 +334,16 @@ pub fn train_criticality_head_multi(
     encoder: &ReferenceRelationalAutoencoder,
     datasets: &[(&GraphTensor, &[LineImpactLabel])],
     config: &CriticalityTrainingConfig,
+) -> Result<(CriticalityHead, TrainingReport)> {
+    let mut observer = NoopTrainingObserver;
+    train_criticality_head_multi_with_observer(encoder, datasets, config, &mut observer)
+}
+
+pub fn train_criticality_head_multi_with_observer(
+    encoder: &ReferenceRelationalAutoencoder,
+    datasets: &[(&GraphTensor, &[LineImpactLabel])],
+    config: &CriticalityTrainingConfig,
+    observer: &mut dyn TrainingObserver,
 ) -> Result<(CriticalityHead, TrainingReport)> {
     let Some((first_graph, _)) = datasets.first() else {
         anyhow::bail!("no graph datasets were provided");
@@ -275,7 +366,7 @@ pub fn train_criticality_head_multi(
         anyhow::bail!("no labels match the graph snapshot datasets");
     }
 
-    let (initial_loss, final_loss) = fit_criticality_head(&mut head, &examples, config)?;
+    let (initial_loss, final_loss) = fit_criticality_head(&mut head, &examples, config, observer)?;
     Ok((
         head,
         TrainingReport {
@@ -294,12 +385,21 @@ pub fn train_reference_multitask(
     datasets: &[(&GraphTensor, &[LineImpactLabel])],
     config: &MultiTaskTrainingConfig,
 ) -> Result<(ReferenceCheckpoint, MultiTaskTrainingReport)> {
+    let mut observer = NoopTrainingObserver;
+    train_reference_multitask_with_observer(datasets, config, &mut observer)
+}
+
+pub fn train_reference_multitask_with_observer(
+    datasets: &[(&GraphTensor, &[LineImpactLabel])],
+    config: &MultiTaskTrainingConfig,
+    observer: &mut dyn TrainingObserver,
+) -> Result<(ReferenceCheckpoint, MultiTaskTrainingReport)> {
     let Some((first_graph, _)) = datasets.first() else {
         anyhow::bail!("no graph datasets were provided");
     };
     let graphs: Vec<&GraphTensor> = datasets.iter().map(|(graph, _)| *graph).collect();
     let (encoder, pretraining_report) =
-        train_reference_autoencoder_multi(&graphs, &config.pretraining)?;
+        train_reference_autoencoder_multi_with_observer(&graphs, &config.pretraining, observer)?;
     let mut embeddings = Vec::with_capacity(graphs.len());
     for graph in &graphs {
         embeddings.push(encoder.encode(graph, &MaskSelection::all_unmasked(graph))?);
@@ -317,12 +417,13 @@ pub fn train_reference_multitask(
     let samples = collect_representation_samples(&representation_inputs, &representation)?;
     let mut representation = representation;
     let (metric_initial_loss, metric_final_loss, metric_triplets) =
-        fit_metric_heads(&mut representation, &samples, config)?;
+        fit_metric_heads(&mut representation, &samples, config, observer)?;
     let criticality = if datasets.iter().any(|(_, labels)| !labels.is_empty()) {
-        Some(train_criticality_head_multi_representation(
+        Some(train_criticality_head_multi_representation_with_observer(
             &representation,
             &representation_inputs,
             &config.criticality,
+            observer,
         )?)
     } else {
         None
@@ -333,6 +434,8 @@ pub fn train_reference_multitask(
         head: criticality.map(|(head, _)| head),
         report: Some(pretraining_report.clone()),
         representation: Some(representation),
+        config_fingerprint: None,
+        seed: Some(config.pretraining.seed),
     };
     let report = MultiTaskTrainingReport {
         backend: "reference-cpu-multitask".into(),
@@ -356,6 +459,21 @@ pub fn train_criticality_head_multi_representation(
     representation: &TrainableLineRepresentationModel,
     datasets: &[(&GraphTensor, &Embeddings, &[LineImpactLabel])],
     config: &CriticalityTrainingConfig,
+) -> Result<(CriticalityHead, TrainingReport)> {
+    let mut observer = NoopTrainingObserver;
+    train_criticality_head_multi_representation_with_observer(
+        representation,
+        datasets,
+        config,
+        &mut observer,
+    )
+}
+
+pub fn train_criticality_head_multi_representation_with_observer(
+    representation: &TrainableLineRepresentationModel,
+    datasets: &[(&GraphTensor, &Embeddings, &[LineImpactLabel])],
+    config: &CriticalityTrainingConfig,
+    observer: &mut dyn TrainingObserver,
 ) -> Result<(CriticalityHead, TrainingReport)> {
     let Some((first_graph, first_embeddings, _)) = datasets.first() else {
         anyhow::bail!("no graph datasets were provided");
@@ -394,7 +512,7 @@ pub fn train_criticality_head_multi_representation(
     if examples.is_empty() {
         anyhow::bail!("no labels match the graph snapshot datasets");
     }
-    let (initial_loss, final_loss) = fit_criticality_head(&mut head, &examples, config)?;
+    let (initial_loss, final_loss) = fit_criticality_head(&mut head, &examples, config, observer)?;
     Ok((
         head,
         TrainingReport {
@@ -483,6 +601,7 @@ fn fit_metric_heads(
     representation: &mut TrainableLineRepresentationModel,
     samples: &[RepresentationSample],
     config: &MultiTaskTrainingConfig,
+    observer: &mut dyn TrainingObserver,
 ) -> Result<(f32, f32, usize)> {
     let mut initial_loss = 0.0;
     let mut final_loss = 0.0;
@@ -494,7 +613,10 @@ fn fit_metric_heads(
         .iter()
         .map(|(_, triplets)| triplets.len())
         .sum();
+    observer.phase_started("metric-learning", Some(config.metric_epochs));
+    observer.learning_rate_changed("metric-learning", 0, config.metric_learning_rate);
     for epoch in 0..config.metric_epochs {
+        observer.epoch_started("metric-learning", epoch + 1, config.metric_epochs);
         let mut loss_sum = 0.0_f64;
         let mut loss_count = 0_usize;
         for (facet, triplets) in &triplets_by_facet {
@@ -581,7 +703,25 @@ fn fit_metric_heads(
             initial_loss = epoch_loss;
         }
         final_loss = epoch_loss;
+        observer.metric(
+            "metric-learning",
+            epoch + 1,
+            epoch + 1,
+            "validation_triplet_loss",
+            epoch_loss,
+        );
+        observer.metric(
+            "metric-learning",
+            epoch + 1,
+            epoch + 1,
+            "triplets",
+            total_triplets as f32,
+        );
+        if epoch % 10 == 0 || epoch + 1 == config.metric_epochs {
+            observer.heartbeat("metric-learning", epoch + 1);
+        }
     }
+    observer.phase_completed("metric-learning");
     Ok((initial_loss, final_loss, total_triplets))
 }
 
@@ -825,10 +965,14 @@ fn fit_criticality_head(
     head: &mut CriticalityHead,
     examples: &[Example],
     config: &CriticalityTrainingConfig,
+    observer: &mut dyn TrainingObserver,
 ) -> Result<(f32, f32)> {
     let mut initial_loss = 0.0;
     let mut final_loss = 0.0;
+    observer.phase_started("criticality", Some(config.epochs));
+    observer.learning_rate_changed("criticality", 0, config.learning_rate);
     for epoch in 0..config.epochs {
+        observer.epoch_started("criticality", epoch + 1, config.epochs);
         let mut epoch_loss = 0.0_f64;
         let mut weight_sum = 0.0_f64;
         for example in examples {
@@ -847,6 +991,16 @@ fn fit_criticality_head(
             initial_loss = epoch_loss as f32;
         }
         final_loss = epoch_loss as f32;
+        observer.metric(
+            "criticality",
+            epoch + 1,
+            epoch + 1,
+            "training_huber_loss",
+            epoch_loss as f32,
+        );
+        if epoch % 10 == 0 || epoch + 1 == config.epochs {
+            observer.heartbeat("criticality", epoch + 1);
+        }
         if config.ranking_weight > 0.0 {
             apply_pairwise_ranking(
                 head,
@@ -857,6 +1011,7 @@ fn fit_criticality_head(
             );
         }
     }
+    observer.phase_completed("criticality");
     Ok((initial_loss, final_loss))
 }
 
