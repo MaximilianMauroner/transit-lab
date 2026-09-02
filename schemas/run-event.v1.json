@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://transit-lab.local/schemas/run-event.v1.json",
+  "title": "Transit Lab structured run event v1",
+  "type": "object",
+  "required": ["schemaVersion", "seq", "runId", "timestamp", "type"],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "seq": {"type": "integer", "minimum": 0},
+    "runId": {"type": "string", "minLength": 1},
+    "timestamp": {"type": "string", "format": "date-time"},
+    "type": {"type": "string"}
+  },
+  "oneOf": [
+    {"required": ["type"], "properties": {"type": {"enum": ["run.queued", "run.started", "run.completed", "run.cancelled"]}}},
+    {"required": ["type", "code", "message"], "properties": {"type": {"enum": ["run.failed", "warning", "error"]}, "code": {"type": "string"}, "message": {"type": "string"}}},
+    {"required": ["type", "step"], "properties": {"type": {"enum": ["step.started", "step.completed"]}, "step": {"type": "string"}}},
+    {"required": ["type", "step", "completed", "total", "unit"], "properties": {"type": {"const": "progress"}, "step": {"type": "string"}, "completed": {"type": "integer", "minimum": 0}, "total": {"type": "integer", "minimum": 0}, "unit": {"type": "string"}}},
+    {"required": ["type", "name", "step", "value"], "properties": {"type": {"const": "metric"}, "name": {"type": "string"}, "step": {"type": "integer", "minimum": 0}, "value": {"type": "number"}, "dimensions": {"type": "object"}}},
+    {"required": ["type", "artifactId", "artifactKind", "uri", "sha256"], "properties": {"type": {"const": "artifact.created"}, "artifactId": {"type": "string"}, "artifactKind": {"type": "string"}, "uri": {"type": "string"}, "sha256": {"type": "string", "pattern": "^[A-Fa-f0-9]{64}$"}}}
+  ],
+  "additionalProperties": true
+}

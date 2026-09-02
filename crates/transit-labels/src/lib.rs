@@ -6,13 +6,55 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
-use transit_domain::{LineIndex, StationIndex, INF_TIME};
+use transit_domain::{hex_digest, sha256_bytes, LineIndex, StationIndex, INF_TIME};
 use transit_router::{OneToAllResult, Router};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LabelGenerationConfig {
     pub accessibility_thresholds_seconds: Vec<u32>,
     pub maximum_origins: usize,
+    #[serde(default)]
+    pub origin_sampling: OriginSamplingConfig,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OriginSamplingConfig {
+    pub seed: u64,
+    pub geographic_fraction: f32,
+    pub interchange_fraction: f32,
+    pub uniform_fraction: f32,
+}
+
+impl Default for OriginSamplingConfig {
+    fn default() -> Self {
+        Self {
+            seed: 7,
+            geographic_fraction: 0.5,
+            interchange_fraction: 0.25,
+            uniform_fraction: 0.25,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OriginCandidate {
+    pub index: StationIndex,
+    pub latitude: f64,
+    pub longitude: f64,
+    pub transfer_degree: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LabelManifest {
+    pub schema_version: String,
+    pub policy_fingerprint: String,
+    pub config: LabelGenerationConfig,
+    pub origin_count: usize,
+}
+
+pub fn label_policy_fingerprint(config: &LabelGenerationConfig) -> String {
+    let encoded = serde_json::to_vec(config).expect("label configuration is serializable");
+    hex_digest(&sha256_bytes(&encoded))
 }
 
 impl Default for LabelGenerationConfig {
@@ -23,6 +65,7 @@ impl Default for LabelGenerationConfig {
                 .map(|minutes| minutes * 60)
                 .collect(),
             maximum_origins: 256,
+            origin_sampling: OriginSamplingConfig::default(),
         }
     }
 }
@@ -40,6 +83,10 @@ pub struct LineImpactLabel {
     /// only by the removed line.
     pub stations_losing_all_service_share: f32,
     pub query_count: u32,
+    /// Identifies the exact label policy, including origin sampling, used to
+    /// produce this row. Older JSONL files deserialize to an empty value.
+    #[serde(default)]
+    pub policy_fingerprint: String,
 }
 
 #[derive(Clone, Debug)]
@@ -56,8 +103,35 @@ pub fn generate_line_removal_labels(
     departures: &[u32],
     config: &LabelGenerationConfig,
 ) -> Vec<LineImpactLabel> {
+    let lines = (0..router.data.line_count)
+        .map(|line| LineIndex(line as u32))
+        .collect::<Vec<_>>();
+    generate_selected_line_removal_labels(router, snapshot, origins, departures, config, &lines)
+}
+
+/// Generate labels only for the requested interventions. This keeps top-K
+/// verification proportional to the number of lines being checked instead of
+/// silently recomputing every line and filtering afterward.
+pub fn generate_selected_line_removal_labels(
+    router: &Router,
+    snapshot: impl Into<String>,
+    origins: &[StationIndex],
+    departures: &[u32],
+    config: &LabelGenerationConfig,
+    selected_lines: &[LineIndex],
+) -> Vec<LineImpactLabel> {
     let origins = select_origins(origins, config.maximum_origins, router.data.station_count);
     if origins.is_empty() || departures.is_empty() || router.data.line_count == 0 {
+        return Vec::new();
+    }
+    let mut lines = selected_lines
+        .iter()
+        .copied()
+        .filter(|line| (line.0 as usize) < router.data.line_count)
+        .collect::<Vec<_>>();
+    lines.sort_unstable();
+    lines.dedup();
+    if lines.is_empty() {
         return Vec::new();
     }
     let queries: Vec<(StationIndex, u32)> = origins
@@ -83,10 +157,10 @@ pub fn generate_line_removal_labels(
         })
         .collect();
     let snapshot = snapshot.into();
-    (0..router.data.line_count)
+    let policy_fingerprint = label_policy_fingerprint(config);
+    lines
         .into_par_iter()
-        .map(|line| {
-            let line_index = LineIndex(line as u32);
+        .map(|line_index| {
             let stations_losing_all_service_share =
                 station_losing_all_service_share(router, line_index);
             let mut auc_loss = 0.0;
@@ -154,6 +228,7 @@ pub fn generate_line_removal_labels(
                     / extra_transfer_count.max(1) as f32,
                 stations_losing_all_service_share,
                 query_count: baselines.len() as u32,
+                policy_fingerprint: policy_fingerprint.clone(),
             }
         })
         .collect()
@@ -208,6 +283,150 @@ fn select_origins(
         .collect()
 }
 
+/// Select a reproducible mix of geographically spread, high-interchange, and
+/// uniform origins. The stable ordering uses coordinates and transfer degree,
+/// not raw GTFS identifiers or compiled station indexes, so an ID-only feed
+/// rewrite does not silently change the experiment.
+pub fn sample_origins(
+    candidates: &[OriginCandidate],
+    maximum: usize,
+    config: &OriginSamplingConfig,
+) -> Vec<StationIndex> {
+    if maximum == 0 || candidates.is_empty() {
+        return Vec::new();
+    }
+    let mut candidates: Vec<OriginCandidate> = candidates
+        .iter()
+        .filter(|candidate| candidate.latitude.is_finite() && candidate.longitude.is_finite())
+        .cloned()
+        .collect();
+    candidates.sort_by(|left, right| stable_candidate_key(left).cmp(&stable_candidate_key(right)));
+    candidates.dedup_by_key(|candidate| candidate.index);
+    if candidates.len() <= maximum {
+        return candidates
+            .into_iter()
+            .map(|candidate| candidate.index)
+            .collect();
+    }
+
+    let geographic_count = ((maximum as f32 * config.geographic_fraction.clamp(0.0, 1.0)).round()
+        as usize)
+        .min(maximum);
+    let interchange_count = ((maximum as f32 * config.interchange_fraction.clamp(0.0, 1.0)).round()
+        as usize)
+        .min(maximum.saturating_sub(geographic_count));
+    let uniform_count = maximum
+        .saturating_sub(geographic_count)
+        .saturating_sub(interchange_count)
+        .min(maximum);
+
+    let mut selected = Vec::with_capacity(maximum);
+    let mut selected_indices = std::collections::BTreeSet::new();
+    let add = |candidate: &OriginCandidate,
+               selected: &mut Vec<StationIndex>,
+               selected_indices: &mut std::collections::BTreeSet<StationIndex>| {
+        if selected.len() < maximum && selected_indices.insert(candidate.index) {
+            selected.push(candidate.index);
+        }
+    };
+
+    for candidate in geographic_order(&candidates, geographic_count, config.seed) {
+        add(candidate, &mut selected, &mut selected_indices);
+    }
+
+    let mut hubs = candidates.iter().collect::<Vec<_>>();
+    hubs.sort_by(|left, right| {
+        right
+            .transfer_degree
+            .cmp(&left.transfer_degree)
+            .then_with(|| stable_candidate_key(left).cmp(&stable_candidate_key(right)))
+    });
+    for candidate in hubs.into_iter().take(interchange_count) {
+        add(candidate, &mut selected, &mut selected_indices);
+    }
+
+    let mut uniform = candidates.iter().collect::<Vec<_>>();
+    uniform.sort_by_key(|candidate| seeded_key(config.seed, candidate));
+    for candidate in uniform.into_iter().take(uniform_count) {
+        add(candidate, &mut selected, &mut selected_indices);
+    }
+
+    // Fractions can overlap heavily on small or hub-dense networks. Fill the
+    // remainder deterministically rather than returning fewer origins than
+    // requested.
+    for candidate in candidates.iter() {
+        add(candidate, &mut selected, &mut selected_indices);
+    }
+    selected
+}
+
+fn geographic_order<'a>(
+    candidates: &'a [OriginCandidate],
+    maximum: usize,
+    seed: u64,
+) -> Vec<&'a OriginCandidate> {
+    if maximum == 0 || candidates.is_empty() {
+        return Vec::new();
+    }
+    let first = candidates
+        .iter()
+        .min_by_key(|candidate| seeded_key(seed ^ 0x9e37_79b9_7f4a_7c15, candidate))
+        .expect("candidate list is not empty");
+    let mut selected = vec![first];
+    while selected.len() < maximum.min(candidates.len()) {
+        let next = candidates
+            .iter()
+            .filter(|candidate| {
+                !selected
+                    .iter()
+                    .any(|chosen| chosen.index == candidate.index)
+            })
+            .max_by(|left, right| {
+                min_distance(left, &selected)
+                    .total_cmp(&min_distance(right, &selected))
+                    .then_with(|| stable_candidate_key(right).cmp(&stable_candidate_key(left)))
+            });
+        let Some(next) = next else { break };
+        selected.push(next);
+    }
+    selected
+}
+
+fn min_distance(candidate: &OriginCandidate, selected: &[&OriginCandidate]) -> f64 {
+    selected
+        .iter()
+        .map(|other| {
+            let latitude_scale = ((candidate.latitude + other.latitude) * 0.5)
+                .to_radians()
+                .cos();
+            let dx = (candidate.longitude - other.longitude) * latitude_scale;
+            let dy = candidate.latitude - other.latitude;
+            dx * dx + dy * dy
+        })
+        .fold(f64::INFINITY, f64::min)
+}
+
+fn stable_candidate_key(candidate: &OriginCandidate) -> (i64, i64, u32) {
+    (
+        (candidate.latitude * 1_000_000.0).round() as i64,
+        (candidate.longitude * 1_000_000.0).round() as i64,
+        candidate.transfer_degree,
+    )
+}
+
+fn seeded_key(seed: u64, candidate: &OriginCandidate) -> u64 {
+    let (latitude, longitude, degree) = stable_candidate_key(candidate);
+    let mut value = seed
+        ^ (latitude as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        ^ (longitude as u64).rotate_left(17)
+        ^ u64::from(degree).rotate_left(31);
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
 fn count_within(result: &OneToAllResult, departure: u32, threshold: u32) -> usize {
     result
         .arrival_seconds
@@ -228,6 +447,27 @@ pub fn save_jsonl(path: &Path, labels: &[LineImpactLabel]) -> Result<()> {
         file.write_all(b"\n")
             .context("writing line label newline")?;
     }
+    Ok(())
+}
+
+pub fn save_label_manifest(
+    path: &Path,
+    config: &LabelGenerationConfig,
+    origin_count: usize,
+) -> Result<()> {
+    let mut manifest_path = path.to_path_buf();
+    manifest_path.set_extension("manifest.json");
+    if let Some(parent) = manifest_path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let manifest = LabelManifest {
+        schema_version: "line-impact-labels-v1".into(),
+        policy_fingerprint: label_policy_fingerprint(config),
+        config: config.clone(),
+        origin_count,
+    };
+    fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)
+        .with_context(|| format!("writing {}", manifest_path.display()))?;
     Ok(())
 }
 
@@ -375,6 +615,7 @@ mod tests {
             &LabelGenerationConfig {
                 accessibility_thresholds_seconds: vec![900],
                 maximum_origins: 1,
+                ..LabelGenerationConfig::default()
             },
         );
         assert_eq!(labels.len(), 1);
@@ -416,6 +657,129 @@ mod tests {
         );
         assert_eq!(labels.len(), 1);
         assert_eq!(labels[0].query_count, 2);
+    }
+
+    #[test]
+    fn origin_sampling_is_seeded_and_coordinate_stable() {
+        let candidates = vec![
+            OriginCandidate {
+                index: StationIndex(10),
+                latitude: 48.10,
+                longitude: 16.10,
+                transfer_degree: 0,
+            },
+            OriginCandidate {
+                index: StationIndex(11),
+                latitude: 48.20,
+                longitude: 16.10,
+                transfer_degree: 4,
+            },
+            OriginCandidate {
+                index: StationIndex(12),
+                latitude: 48.10,
+                longitude: 16.30,
+                transfer_degree: 2,
+            },
+            OriginCandidate {
+                index: StationIndex(13),
+                latitude: 48.30,
+                longitude: 16.30,
+                transfer_degree: 0,
+            },
+            OriginCandidate {
+                index: StationIndex(14),
+                latitude: 48.25,
+                longitude: 16.20,
+                transfer_degree: 1,
+            },
+        ];
+        let config = OriginSamplingConfig::default();
+        let first = sample_origins(&candidates, 3, &config);
+        let second = sample_origins(&candidates, 3, &config);
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 3);
+        assert!(first.contains(&StationIndex(11)));
+
+        let renamed_indexes = candidates
+            .iter()
+            .map(|candidate| OriginCandidate {
+                index: StationIndex(candidate.index.0 + 100),
+                ..candidate.clone()
+            })
+            .collect::<Vec<_>>();
+        let renamed = sample_origins(&renamed_indexes, 3, &config);
+        let coordinate_keys = |indexes: &[StationIndex], pool: &[OriginCandidate]| {
+            indexes
+                .iter()
+                .filter_map(|index| pool.iter().find(|candidate| candidate.index == *index))
+                .map(stable_candidate_key)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            coordinate_keys(&first, &candidates),
+            coordinate_keys(&renamed, &renamed_indexes)
+        );
+    }
+
+    #[test]
+    fn label_rows_carry_the_policy_fingerprint() {
+        let config = LabelGenerationConfig::default();
+        let router = Router::new(
+            RoutingData {
+                station_count: 2,
+                line_count: 1,
+                patterns: vec![RoutingPattern {
+                    line: LineIndex(0),
+                    stops: vec![StationIndex(0), StationIndex(1)],
+                    trips: vec![trip()],
+                }],
+                transfers: Vec::new(),
+            },
+            RouterConfig::default(),
+        );
+        let labels =
+            generate_line_removal_labels(&router, "snapshot", &[StationIndex(0)], &[90], &config);
+        assert_eq!(
+            labels[0].policy_fingerprint,
+            label_policy_fingerprint(&config)
+        );
+    }
+
+    #[test]
+    fn selected_label_generation_does_not_run_unselected_lines() {
+        let router = Router::new(
+            RoutingData {
+                station_count: 2,
+                line_count: 2,
+                patterns: vec![
+                    RoutingPattern {
+                        line: LineIndex(0),
+                        stops: vec![StationIndex(0), StationIndex(1)],
+                        trips: vec![trip()],
+                    },
+                    RoutingPattern {
+                        line: LineIndex(1),
+                        stops: vec![StationIndex(0), StationIndex(1)],
+                        trips: vec![trip()],
+                    },
+                ],
+                transfers: Vec::new(),
+            },
+            RouterConfig::default(),
+        );
+        let labels = generate_selected_line_removal_labels(
+            &router,
+            "snapshot",
+            &[StationIndex(0)],
+            &[90],
+            &LabelGenerationConfig {
+                maximum_origins: 1,
+                ..LabelGenerationConfig::default()
+            },
+            &[LineIndex(1)],
+        );
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0].line, LineIndex(1));
     }
 
     #[test]

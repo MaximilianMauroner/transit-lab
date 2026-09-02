@@ -1,0 +1,9 @@
+{
+  "name": "@transit-lab/worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@transit-lab/contracts": "workspace:*"
+  }
+}

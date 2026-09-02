@@ -1,0 +1,20 @@
+{
+  "name": "transit-lab-control-plane",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "apps/studio",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "bun run apps/studio/src/server/index.js",
+    "studio": "bun run apps/studio/src/server/index.js",
+    "worker": "bun run apps/studio/src/worker/index.js",
+    "studio:worker": "bun run apps/studio/src/worker/index.js",
+    "worker:once": "bun run apps/studio/src/worker/index.js --once",
+    "build": "bun run apps/studio/src/client/build.js",
+    "test": "bun test apps/studio packages display web-wrapper",
+    "check": "bun run --cwd apps/studio check"
+  }
+}

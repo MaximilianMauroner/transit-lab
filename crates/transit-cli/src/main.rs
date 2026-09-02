@@ -1,18 +1,24 @@
 use anyhow::{bail, Context, Result};
-use chrono::NaiveDate;
+use chrono::{NaiveDate, SecondsFormat, Utc};
 use clap::{Args, Parser, Subcommand};
 use gtfs_compile::{compile, load_snapshot, save_snapshot, CompileOptions, LineGroupingPolicy};
 use gtfs_ingest::{CalendarRecord, GtfsFeed, RouteRecord, StopRecord, StopTimeRecord, TripRecord};
 use gtfs_source::{feed_by_id, fetch_feed, load_source_metadata, raw_feed_directory};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
-use transit_domain::{parse_departure_time, sha256_bytes, ValidationReport};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use transit_domain::{hex_digest, parse_departure_time, sha256_bytes, ValidationReport};
 use transit_graph::GraphTensor;
 use transit_inference::{
     load_predictions, predict_reference, rank_by_accessibility, save_predictions,
 };
-use transit_labels::{generate_line_removal_labels, load_jsonl, save_jsonl, LabelGenerationConfig};
+use transit_labels::{
+    generate_line_removal_labels, generate_selected_line_removal_labels, load_jsonl,
+    sample_origins, save_jsonl, save_label_manifest, LabelGenerationConfig, OriginCandidate,
+};
 use transit_model::{
     MaskConfig, MaskSelection, ModelConfig, ReferenceLineRepresentationEncoder,
     ReferenceRelationalAutoencoder,
@@ -134,6 +140,8 @@ struct LabelsArgs {
     departure_times: Vec<String>,
     #[arg(long, default_value_t = 4)]
     maximum_transfers: u8,
+    #[arg(long, default_value_t = 7)]
+    seed: u64,
 }
 
 #[derive(Debug, Subcommand)]
@@ -192,6 +200,8 @@ struct InferArgs {
     model: PathBuf,
     #[arg(long)]
     output: PathBuf,
+    #[arg(long, default_value = "unknown-model")]
+    model_id: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -242,7 +252,22 @@ struct DemoArgs {
 }
 
 fn main() -> Result<()> {
-    run(Cli::parse().command)
+    let command = Cli::parse().command;
+    emit_runtime_event("run.started", json!({}))?;
+    match run(command) {
+        Ok(()) => {
+            emit_runtime_event("run.completed", json!({}))?;
+            Ok(())
+        }
+        Err(error) => {
+            let message = error.to_string();
+            let _ = emit_runtime_event(
+                "run.failed",
+                json!({"code": "rust-command-failed", "message": message}),
+            );
+            Err(error)
+        }
+    }
 }
 
 fn run(command: Command) -> Result<()> {
@@ -298,6 +323,7 @@ fn command_fetch(args: FetchArgs) -> Result<()> {
     )
     .context("moving immutable source metadata")?;
     std::fs::remove_dir_all(args.output.join(&spec.id).join("download"))?;
+    write_artifact_manifest(&final_directory, "raw-gtfs-feed")?;
     println!("{}", serde_json::to_string_pretty(&metadata)?);
     Ok(())
 }
@@ -343,6 +369,7 @@ fn command_compile(args: CompileArgs) -> Result<()> {
     }
     let network = compile(&feed, &options)?;
     save_snapshot(&network, &args.output)?;
+    write_artifact_manifest(&args.output, "compiled-snapshot")?;
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
@@ -361,6 +388,7 @@ fn command_graph_build(args: GraphBuildArgs) -> Result<()> {
     let network = load_snapshot(&args.snapshot)?;
     let graph = GraphTensor::from_network(&network)?;
     graph.save(&args.output, &network)?;
+    write_artifact_manifest(&args.output, "compiled-graph")?;
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
@@ -382,16 +410,27 @@ fn command_labels(args: LabelsArgs) -> Result<()> {
             ..RouterConfig::default()
         },
     )?;
-    let origins = evenly_spaced_origins(network.stations.len(), args.origins);
     let departures = args
         .departure_times
         .iter()
         .map(|value| parse_departure_time(value))
         .collect::<Result<Vec<_>>>()?;
-    let label_config = LabelGenerationConfig {
+    let mut label_config = LabelGenerationConfig {
         maximum_origins: args.origins,
         ..LabelGenerationConfig::default()
     };
+    label_config.origin_sampling.seed = args.seed;
+    let candidates = network
+        .stations
+        .iter()
+        .map(|station| OriginCandidate {
+            index: station.index,
+            latitude: station.latitude,
+            longitude: station.longitude,
+            transfer_degree: station.transfer_degree,
+        })
+        .collect::<Vec<_>>();
+    let origins = sample_origins(&candidates, args.origins, &label_config.origin_sampling);
     let labels = generate_line_removal_labels(
         &router,
         network.snapshot_id.clone(),
@@ -400,6 +439,8 @@ fn command_labels(args: LabelsArgs) -> Result<()> {
         &label_config,
     );
     save_jsonl(&args.output, &labels)?;
+    save_label_manifest(&args.output, &label_config, origins.len())?;
+    write_artifact_manifest(&args.output, "criticality-labels")?;
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({"labels": labels.len(), "output": args.output}))?
@@ -425,6 +466,7 @@ fn command_pretrain(args: PretrainArgs) -> Result<()> {
             representation: None,
         },
     )?;
+    write_artifact_manifest(&args.output, "model-checkpoint")?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
@@ -449,6 +491,7 @@ fn command_criticality(args: CriticalityArgs) -> Result<()> {
             representation: checkpoint.representation,
         },
     )?;
+    write_artifact_manifest(&args.output, "model-checkpoint")?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
@@ -485,6 +528,7 @@ fn command_multitask(args: MultiTaskArgs) -> Result<()> {
         .collect();
     let (checkpoint, report) = train_reference_multitask(&datasets, &config)?;
     save_checkpoint(&args.output, &checkpoint)?;
+    write_artifact_manifest(&args.output, "model-checkpoint")?;
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
@@ -499,8 +543,10 @@ fn command_infer(args: InferArgs) -> Result<()> {
     let graph = GraphTensor::load(&args.graph)?;
     let checkpoint = load_checkpoint(&args.model)?;
     let mut predictions = predict_reference(&checkpoint, &graph)?;
+    predictions.model_id = Some(args.model_id);
     rank_by_accessibility(&mut predictions);
     save_predictions(&args.output, &predictions)?;
+    write_artifact_manifest(&args.output, "inference-result")?;
     println!("{}", serde_json::to_string_pretty(&predictions)?);
     Ok(())
 }
@@ -510,28 +556,43 @@ fn command_verify_top_lines(args: VerifyTopLinesArgs) -> Result<()> {
     let prediction_path = args.predictions;
     let predictions = load_predictions(&prediction_path)?;
     let router = Router::from_network(&network, RouterConfig::default())?;
-    let origins = evenly_spaced_origins(network.stations.len(), 256);
+    let label_config = LabelGenerationConfig::default();
+    let candidates = network
+        .stations
+        .iter()
+        .map(|station| OriginCandidate {
+            index: station.index,
+            latitude: station.latitude,
+            longitude: station.longitude,
+            transfer_degree: station.transfer_degree,
+        })
+        .collect::<Vec<_>>();
+    let origins = sample_origins(
+        &candidates,
+        label_config.maximum_origins,
+        &label_config.origin_sampling,
+    );
     let departures = args
         .departure_times
         .iter()
         .map(|value| parse_departure_time(value))
         .collect::<Result<Vec<_>>>()?;
-    let labels = generate_line_removal_labels(
+    let selected_lines = predictions
+        .predictions
+        .iter()
+        .take(args.top_k)
+        .map(|prediction| transit_domain::LineIndex(prediction.line))
+        .collect::<Vec<_>>();
+    let labels = generate_selected_line_removal_labels(
         &router,
         network.snapshot_id.clone(),
         &origins,
         &departures,
-        &LabelGenerationConfig::default(),
+        &label_config,
+        &selected_lines,
     );
-    let top_lines: std::collections::HashSet<u32> = predictions
-        .predictions
-        .iter()
-        .take(args.top_k)
-        .map(|prediction| prediction.line)
-        .collect();
     let verified: Vec<_> = labels
         .into_iter()
-        .filter(|label| top_lines.contains(&label.line.0))
         .map(|label| {
             let display_name = network
                 .lines
@@ -670,7 +731,26 @@ fn command_demo(args: DemoArgs) -> Result<()> {
     let graph_dir = args.output.join("graph");
     graph.save(&graph_dir, &network)?;
     let router = Router::from_network(&network, RouterConfig::default())?;
-    let origins = evenly_spaced_origins(network.stations.len(), network.stations.len());
+    let mut label_config = LabelGenerationConfig {
+        maximum_origins: network.stations.len(),
+        ..LabelGenerationConfig::default()
+    };
+    label_config.origin_sampling.seed = 7;
+    let candidates = network
+        .stations
+        .iter()
+        .map(|station| OriginCandidate {
+            index: station.index,
+            latitude: station.latitude,
+            longitude: station.longitude,
+            transfer_degree: station.transfer_degree,
+        })
+        .collect::<Vec<_>>();
+    let origins = sample_origins(
+        &candidates,
+        label_config.maximum_origins,
+        &label_config.origin_sampling,
+    );
     let departures = vec![
         parse_departure_time("07:30")?,
         parse_departure_time("08:30")?,
@@ -680,10 +760,12 @@ fn command_demo(args: DemoArgs) -> Result<()> {
         network.snapshot_id.clone(),
         &origins,
         &departures,
-        &LabelGenerationConfig::default(),
+        &label_config,
     );
     let labels_path = args.output.join("labels.jsonl");
     save_jsonl(&labels_path, &labels)?;
+    save_label_manifest(&labels_path, &label_config, origins.len())?;
+    write_artifact_manifest(&labels_path, "criticality-labels")?;
     let pretraining = PretrainingConfig {
         model: ModelConfig {
             hidden_dimension: 32,
@@ -719,9 +801,13 @@ fn command_demo(args: DemoArgs) -> Result<()> {
             representation: None,
         },
     )?;
+    write_artifact_manifest(&checkpoint_path, "model-checkpoint")?;
     let mut predictions = predict_reference(&load_checkpoint(&checkpoint_path)?, &graph)?;
+    predictions.model_id = Some("model-demo-reference".into());
     rank_by_accessibility(&mut predictions);
-    save_predictions(&args.output.join("predictions.json"), &predictions)?;
+    let predictions_path = args.output.join("predictions.json");
+    save_predictions(&predictions_path, &predictions)?;
+    write_artifact_manifest(&predictions_path, "inference-result")?;
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
@@ -737,26 +823,6 @@ fn command_demo(args: DemoArgs) -> Result<()> {
     Ok(())
 }
 
-fn evenly_spaced_origins(
-    station_count: usize,
-    requested: usize,
-) -> Vec<transit_domain::StationIndex> {
-    if station_count == 0 || requested == 0 {
-        return Vec::new();
-    }
-    if requested >= station_count {
-        return (0..station_count)
-            .map(|index| transit_domain::StationIndex(index as u32))
-            .collect();
-    }
-    (0..requested)
-        .map(|index| {
-            let station = index * station_count / requested;
-            transit_domain::StationIndex(station as u32)
-        })
-        .collect()
-}
-
 fn source_metadata_path(input: &std::path::Path) -> Option<PathBuf> {
     let candidate = if input.is_dir() {
         input.join("source.json")
@@ -764,6 +830,175 @@ fn source_metadata_path(input: &std::path::Path) -> Option<PathBuf> {
         input.parent()?.join("source.json")
     };
     candidate.is_file().then_some(candidate)
+}
+
+static RUNTIME_EVENT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Emit machine-readable events only when the Studio worker opts into the
+/// protocol. Human stdout remains a separate diagnostic stream.
+fn emit_runtime_event(event_type: &str, payload: Value) -> Result<()> {
+    let Some(event_path) = std::env::var_os("TRANSIT_EVENT_FILE") else {
+        return Ok(());
+    };
+    let Some(run_id) = std::env::var_os("TRANSIT_RUN_ID") else {
+        return Ok(());
+    };
+    let run_id = run_id.to_string_lossy().into_owned();
+    let mut event = serde_json::Map::new();
+    event.insert("schemaVersion".into(), json!(1));
+    event.insert(
+        "seq".into(),
+        json!(RUNTIME_EVENT_SEQUENCE.fetch_add(1, Ordering::Relaxed)),
+    );
+    event.insert("runId".into(), json!(run_id));
+    event.insert(
+        "timestamp".into(),
+        json!(Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)),
+    );
+    event.insert("type".into(), json!(event_type));
+    if let Value::Object(fields) = payload {
+        event.extend(fields);
+    }
+    let path = PathBuf::from(event_path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+    serde_json::to_writer(&mut file, &Value::Object(event))?;
+    file.write_all(b"\n")?;
+    Ok(())
+}
+
+fn artifact_manifest_path(output: &Path) -> PathBuf {
+    if output.is_dir() {
+        output.join("artifact-manifest.json")
+    } else {
+        let name = output
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("output");
+        output
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(format!("{name}.artifact-manifest.json"))
+    }
+}
+
+fn artifact_file_entries(path: &Path, root: &Path, entries: &mut Vec<Value>) -> Result<()> {
+    let path = fs::canonicalize(path)
+        .with_context(|| format!("resolving artifact output {}", path.display()))?;
+    if path.is_file() {
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("");
+        if name == "events.jsonl"
+            || name == "artifact-manifest.json"
+            || name.ends_with(".artifact-manifest.json")
+        {
+            return Ok(());
+        }
+        let bytes = fs::read(&path)?;
+        let relative = path
+            .strip_prefix(root)
+            .with_context(|| {
+                format!(
+                    "artifact output {} is outside repository root {}",
+                    path.display(),
+                    root.display()
+                )
+            })?
+            .to_string_lossy()
+            .replace('\\', "/");
+        entries.push(json!({
+            "path": relative,
+            "sizeBytes": bytes.len(),
+            "sha256": hex_digest(&sha256_bytes(&bytes)),
+        }));
+        return Ok(());
+    }
+    if path.is_dir() {
+        for child in fs::read_dir(&path)? {
+            artifact_file_entries(&child?.path(), root, entries)?;
+        }
+    }
+    Ok(())
+}
+
+/// Write the shared artifact-manifest.v1 contract next to a Rust output.
+/// Existing manifests are immutable and must describe the same output.
+fn write_artifact_manifest(output: &Path, kind: &str) -> Result<()> {
+    if !output.exists() {
+        bail!("cannot manifest missing Rust output {}", output.display());
+    }
+    let artifact_root = std::env::var_os("TRANSIT_LAB_ARTIFACT_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or(std::env::current_dir()?);
+    let root = fs::canonicalize(&artifact_root)
+        .with_context(|| format!("resolving artifact root {}", artifact_root.display()))?;
+    let mut files = Vec::new();
+    artifact_file_entries(output, &root, &mut files)?;
+    files.sort_by(|left, right| left["path"].as_str().cmp(&right["path"].as_str()));
+    if files.is_empty() {
+        bail!("cannot manifest empty Rust output {}", output.display());
+    }
+    let file_bytes = serde_json::to_vec(&files)?;
+    let digest = hex_digest(&sha256_bytes(&file_bytes));
+    let manifest = json!({
+        "schemaVersion": 1,
+        "artifactId": format!("artifact-{kind}-{}", &digest[..24]),
+        "kind": kind,
+        "fingerprint": digest,
+        "sha256": if files.len() == 1 { files[0]["sha256"].clone() } else { json!(hex_digest(&sha256_bytes(&file_bytes))) },
+        "createdAt": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        "producingRunId": std::env::var("TRANSIT_RUN_ID").ok(),
+        "inputs": [],
+        "gitCommit": std::env::var("TRANSIT_LAB_GIT_COMMIT").unwrap_or_else(|_| "working-tree".into()),
+        "configuration": {"producer": "transit-cli", "kind": kind},
+        "files": files,
+        "metadata": {}
+    });
+    let manifest_path = artifact_manifest_path(output);
+    if let Ok(existing) = fs::read(&manifest_path) {
+        let existing: Value =
+            serde_json::from_slice(&existing).context("decoding existing artifact manifest")?;
+        if existing["fingerprint"] != manifest["fingerprint"]
+            || existing["files"] != manifest["files"]
+            || existing["kind"] != manifest["kind"]
+        {
+            bail!(
+                "refusing to overwrite immutable artifact manifest {}",
+                manifest_path.display()
+            );
+        }
+        return Ok(());
+    }
+    let encoded = serde_json::to_vec_pretty(&manifest)?;
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&manifest_path)
+        .with_context(|| format!("creating {}", manifest_path.display()))?;
+    file.write_all(&encoded)?;
+    file.write_all(b"\n")?;
+    let uri = fs::canonicalize(&manifest_path)
+        .ok()
+        .and_then(|path| {
+            path.strip_prefix(&root)
+                .ok()
+                .map(|value| value.to_string_lossy().replace('\\', "/"))
+        })
+        .unwrap_or_else(|| manifest_path.to_string_lossy().replace('\\', "/"));
+    emit_runtime_event(
+        "artifact.created",
+        json!({
+            "artifactId": manifest["artifactId"],
+            "artifactKind": kind,
+            "uri": uri,
+            "sha256": manifest["sha256"],
+        }),
+    )?;
+    Ok(())
 }
 
 fn demo_feed() -> GtfsFeed {

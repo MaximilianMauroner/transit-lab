@@ -16,7 +16,14 @@ use transit_training::ReferenceCheckpoint;
 pub struct LinePrediction {
     pub line: u32,
     pub metrics: Vec<f32>,
+    #[serde(rename = "structuralUniqueness", alias = "structural_uniqueness")]
     pub structural_uniqueness: f32,
+    #[serde(
+        rename = "metricPercentiles",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub metric_percentiles: Vec<f32>,
     /// Named form of `metrics`, included for clients that should not depend
     /// on output ordering. The vector remains for backwards compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -55,13 +62,33 @@ pub struct LineEmbeddingRecord {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PredictionFile {
+    #[serde(rename = "schemaVersion", default = "inference_schema_version")]
+    pub schema_version: u32,
+    #[serde(rename = "modelId", default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    #[serde(rename = "snapshotId", alias = "snapshot_id")]
     pub snapshot_id: String,
+    #[serde(rename = "metricNames", alias = "metric_names")]
     pub metric_names: Vec<String>,
     pub predictions: Vec<LinePrediction>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        rename = "lineNames",
+        alias = "line_names",
+        default,
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub line_names: BTreeMap<String, String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        rename = "lineEmbeddings",
+        alias = "line_embeddings",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub line_embeddings: Vec<LineEmbeddingRecord>,
+}
+
+fn inference_schema_version() -> u32 {
+    1
 }
 
 pub fn predict_reference(
@@ -112,6 +139,7 @@ pub fn predict_reference(
                 line: line as u32,
                 metrics,
                 structural_uniqueness: structural.get(line).copied().unwrap_or(0.0),
+                metric_percentiles: Vec::new(),
                 criticality: Some(criticality),
                 uncertainty: 0.0,
             }
@@ -138,7 +166,9 @@ pub fn predict_reference(
             anomaly_score: structural.get(line).copied().unwrap_or(0.0),
         })
         .collect();
-    Ok(PredictionFile {
+    let mut output = PredictionFile {
+        schema_version: inference_schema_version(),
+        model_id: None,
         snapshot_id: graph.manifest.snapshot_id.clone(),
         metric_names: vec![
             "accessibility_auc_loss".into(),
@@ -151,7 +181,37 @@ pub fn predict_reference(
         predictions,
         line_names,
         line_embeddings,
-    })
+    };
+    add_metric_percentiles(&mut output);
+    Ok(output)
+}
+
+/// Add empirical percentiles to the Rust-owned inference result so clients do
+/// not need to derive model-facing ranks from raw predictions.
+pub fn add_metric_percentiles(predictions: &mut PredictionFile) {
+    let row_count = predictions.predictions.len();
+    if row_count == 0 {
+        return;
+    }
+    for metric_index in 0..predictions.metric_names.len() {
+        let mut values: Vec<f32> = predictions
+            .predictions
+            .iter()
+            .filter_map(|prediction| prediction.metrics.get(metric_index).copied())
+            .collect();
+        values.sort_by(f32::total_cmp);
+        for prediction in &mut predictions.predictions {
+            let value = prediction.metrics.get(metric_index).copied().unwrap_or(0.0);
+            let rank = values
+                .iter()
+                .filter(|candidate| **candidate <= value)
+                .count();
+            if prediction.metric_percentiles.len() < predictions.metric_names.len() {
+                prediction.metric_percentiles = vec![0.0; predictions.metric_names.len()];
+            }
+            prediction.metric_percentiles[metric_index] = rank as f32 / row_count as f32;
+        }
+    }
 }
 
 fn criticality_from_metrics(metrics: &[f32], uncertainty: f32) -> CriticalityPrediction {

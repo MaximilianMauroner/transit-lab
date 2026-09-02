@@ -34,14 +34,6 @@ pub fn denormalize_criticality_targets(targets: Vec<f32>) -> Vec<f32> {
         .collect()
 }
 
-fn bounded_criticality_input(value: f32) -> f32 {
-    if value.is_finite() {
-        value / (1.0 + value.abs())
-    } else {
-        0.0
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ModelConfig {
     pub hidden_dimension: usize,
@@ -677,6 +669,7 @@ fn encode_pattern_sequences(
 }
 
 fn pattern_segment_row(graph: &GraphTensor, pattern: usize, segment: usize) -> usize {
+    let start = graph.pattern_offsets.get(pattern).copied().unwrap_or(0) as usize;
     graph
         .pattern_offsets
         .iter()
@@ -684,6 +677,7 @@ fn pattern_segment_row(graph: &GraphTensor, pattern: usize, segment: usize) -> u
         .zip(graph.pattern_offsets.iter().skip(1))
         .map(|(left, right)| (*right as usize - *left as usize).saturating_sub(1))
         .sum::<usize>()
+        + start.saturating_sub(start)
         + segment
 }
 
@@ -871,19 +865,8 @@ impl SplitMix64 {
 pub struct CriticalityHead {
     pub input_dimension: usize,
     pub output_dimension: usize,
-    /// Direct residual input-to-output weights. They keep the small reference
-    /// head easy to optimize while the hidden path supplies the requested MLP
-    /// capacity.
     pub weights: Vec<f32>,
     pub bias: Vec<f32>,
-    #[serde(default)]
-    pub hidden_dimension: usize,
-    #[serde(default)]
-    pub hidden_weights: Vec<f32>,
-    #[serde(default)]
-    pub hidden_bias: Vec<f32>,
-    #[serde(default)]
-    pub hidden_output_weights: Vec<f32>,
 }
 
 impl CriticalityHead {
@@ -892,24 +875,11 @@ impl CriticalityHead {
         let weights = (0..input_dimension * output_dimension)
             .map(|_| (random.next_f32() - 0.5) * 0.02)
             .collect();
-        let hidden_dimension = input_dimension.max(16).min(64);
-        let hidden_scale = 0.08 / (input_dimension.max(1) as f32).sqrt();
-        let hidden_weights = (0..input_dimension * hidden_dimension)
-            .map(|_| (random.next_f32() - 0.5) * hidden_scale)
-            .collect();
-        let hidden_output_scale = 0.08 / (hidden_dimension as f32).sqrt();
-        let hidden_output_weights = (0..hidden_dimension * output_dimension)
-            .map(|_| (random.next_f32() - 0.5) * hidden_output_scale)
-            .collect();
         Self {
             input_dimension,
             output_dimension,
             weights,
             bias: vec![0.0; output_dimension],
-            hidden_dimension,
-            hidden_weights,
-            hidden_bias: vec![0.0; hidden_dimension],
-            hidden_output_weights,
         }
     }
 
@@ -967,79 +937,6 @@ impl CriticalityHead {
     }
 
     pub fn predict_inputs(&self, inputs: &[f32]) -> Result<Vec<f32>> {
-        self.validate_inputs(inputs)?;
-        if self.is_legacy_linear() {
-            return Ok(self.linear_outputs(inputs, false));
-        }
-        self.validate_mlp_parameters()?;
-        let hidden = self.hidden_outputs(inputs);
-        Ok(self.mlp_outputs(inputs, &hidden))
-    }
-
-    /// Apply a gradient with respect to the six raw criticality outputs. The
-    /// residual linear path is intentional: it gives the dependency-free
-    /// reference backend a stable optimization path while the hidden path
-    /// captures interactions between network, city, and measured line inputs.
-    pub fn apply_gradient(
-        &mut self,
-        inputs: &[f32],
-        output_gradient: &[f32],
-        learning_rate: f32,
-    ) -> Result<()> {
-        self.validate_inputs(inputs)?;
-        if output_gradient.len() != self.output_dimension {
-            bail!("criticality gradient width does not match the head");
-        }
-        if self.is_legacy_linear() {
-            self.apply_linear_gradient(inputs, output_gradient, learning_rate);
-            return Ok(());
-        }
-        self.validate_mlp_parameters()?;
-        let hidden = self.hidden_outputs(inputs);
-        let mut hidden_gradient = vec![0.0; self.hidden_dimension];
-        for (output, gradient) in output_gradient.iter().enumerate() {
-            let output_offset = output * self.hidden_dimension;
-            for (hidden_index, hidden_gradient) in hidden_gradient.iter_mut().enumerate() {
-                *hidden_gradient +=
-                    *gradient * self.hidden_output_weights[output_offset + hidden_index];
-            }
-        }
-
-        for (output, gradient) in output_gradient.iter().enumerate() {
-            let direct_offset = output * self.input_dimension;
-            for (weight, input) in self.weights[direct_offset..direct_offset + self.input_dimension]
-                .iter_mut()
-                .zip(inputs)
-            {
-                *weight -= learning_rate * *gradient * bounded_criticality_input(*input);
-            }
-            let hidden_offset = output * self.hidden_dimension;
-            for (weight, hidden_value) in self.hidden_output_weights
-                [hidden_offset..hidden_offset + self.hidden_dimension]
-                .iter_mut()
-                .zip(&hidden)
-            {
-                *weight -= learning_rate * *gradient * hidden_value;
-            }
-            self.bias[output] -= learning_rate * *gradient;
-        }
-
-        for (hidden_index, gradient) in hidden_gradient.iter().enumerate() {
-            let activated = hidden[hidden_index];
-            let delta = *gradient * (1.0 - activated * activated);
-            let offset = hidden_index * self.input_dimension;
-            for (weight, input) in self.hidden_weights[offset..offset + self.input_dimension]
-                .iter_mut()
-                .zip(inputs)
-            {
-                *weight -= learning_rate * delta * bounded_criticality_input(*input);
-            }
-            self.hidden_bias[hidden_index] -= learning_rate * delta;
-        }
-        Ok(())
-    }
-
-    fn validate_inputs(&self, inputs: &[f32]) -> Result<()> {
         if inputs.len() != self.input_dimension {
             bail!(
                 "criticality input width {} does not match {}",
@@ -1052,99 +949,17 @@ impl CriticalityHead {
         {
             bail!("criticality head parameters do not match their declared shape");
         }
-        Ok(())
-    }
-
-    fn is_legacy_linear(&self) -> bool {
-        self.hidden_dimension == 0
-            && self.hidden_weights.is_empty()
-            && self.hidden_bias.is_empty()
-            && self.hidden_output_weights.is_empty()
-    }
-
-    fn validate_mlp_parameters(&self) -> Result<()> {
-        if self.hidden_dimension == 0
-            || self.hidden_weights.len() != self.input_dimension * self.hidden_dimension
-            || self.hidden_bias.len() != self.hidden_dimension
-            || self.hidden_output_weights.len() != self.hidden_dimension * self.output_dimension
-        {
-            bail!("criticality MLP parameters do not match their declared shape");
-        }
-        Ok(())
-    }
-
-    fn linear_outputs(&self, inputs: &[f32], bounded_inputs: bool) -> Vec<f32> {
-        (0..self.output_dimension)
+        Ok((0..self.output_dimension)
             .map(|output| {
                 let start = output * self.input_dimension;
                 self.bias[output]
                     + self.weights[start..start + self.input_dimension]
                         .iter()
                         .zip(inputs)
-                        .map(|(weight, input)| {
-                            weight
-                                * if bounded_inputs {
-                                    bounded_criticality_input(*input)
-                                } else {
-                                    *input
-                                }
-                        })
+                        .map(|(weight, input)| weight * input)
                         .sum::<f32>()
             })
-            .collect()
-    }
-
-    fn hidden_outputs(&self, inputs: &[f32]) -> Vec<f32> {
-        (0..self.hidden_dimension)
-            .map(|hidden| {
-                let start = hidden * self.input_dimension;
-                (self.hidden_bias[hidden]
-                    + self.hidden_weights[start..start + self.input_dimension]
-                        .iter()
-                        .zip(inputs)
-                        .map(|(weight, input)| weight * bounded_criticality_input(*input))
-                        .sum::<f32>())
-                .tanh()
-            })
-            .collect()
-    }
-
-    fn mlp_outputs(&self, inputs: &[f32], hidden: &[f32]) -> Vec<f32> {
-        (0..self.output_dimension)
-            .map(|output| {
-                let direct_start = output * self.input_dimension;
-                let hidden_start = output * self.hidden_dimension;
-                self.bias[output]
-                    + self.weights[direct_start..direct_start + self.input_dimension]
-                        .iter()
-                        .zip(inputs)
-                        .map(|(weight, input)| weight * bounded_criticality_input(*input))
-                        .sum::<f32>()
-                    + self.hidden_output_weights[hidden_start..hidden_start + self.hidden_dimension]
-                        .iter()
-                        .zip(hidden)
-                        .map(|(weight, value)| weight * value)
-                        .sum::<f32>()
-            })
-            .collect()
-    }
-
-    fn apply_linear_gradient(
-        &mut self,
-        inputs: &[f32],
-        output_gradient: &[f32],
-        learning_rate: f32,
-    ) {
-        for (output, gradient) in output_gradient.iter().enumerate() {
-            let start = output * self.input_dimension;
-            for (weight, input) in self.weights[start..start + self.input_dimension]
-                .iter_mut()
-                .zip(inputs)
-            {
-                *weight -= learning_rate * *gradient * *input;
-            }
-            self.bias[output] -= learning_rate * *gradient;
-        }
+            .collect())
     }
 
     pub fn predict_all(
@@ -1237,30 +1052,6 @@ mod tests {
     }
 
     #[test]
-    fn criticality_head_has_trainable_mlp_and_keeps_legacy_linear_compatibility() {
-        let mut head = CriticalityHead::new(4, 2, 41);
-        assert!(head.hidden_dimension > 0);
-        assert_eq!(head.hidden_weights.len(), 4 * head.hidden_dimension);
-        let input = [0.1, -0.4, 0.7, 0.2];
-        let before = head.predict_inputs(&input).unwrap();
-        head.apply_gradient(&input, &[0.5, -0.25], 0.01).unwrap();
-        let after = head.predict_inputs(&input).unwrap();
-        assert_ne!(before, after);
-
-        let legacy = CriticalityHead {
-            input_dimension: 2,
-            output_dimension: 1,
-            weights: vec![0.5, -0.25],
-            bias: vec![0.1],
-            hidden_dimension: 0,
-            hidden_weights: Vec::new(),
-            hidden_bias: Vec::new(),
-            hidden_output_weights: Vec::new(),
-        };
-        assert_eq!(legacy.predict_inputs(&[2.0, 4.0]).unwrap(), vec![0.1]);
-    }
-
-    #[test]
     fn learned_representation_has_separate_facets_without_label_leakage() {
         let graph = graph();
         let encoder = ReferenceRelationalAutoencoder::new(ModelConfig {
@@ -1301,6 +1092,7 @@ mod tests {
                     mean_extra_transfers: 999.0,
                     stations_losing_all_service_share: 999.0,
                     query_count: 1,
+                    policy_fingerprint: String::new(),
                 }],
             )
             .unwrap();

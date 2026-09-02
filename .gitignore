@@ -1,11 +1,14 @@
 /target/
+node_modules/
 /data/raw/
 /data/snapshots/
 /data/graphs/
 /data/labels/
 /data/runs/
 /data/models/
+data/*.sqlite
 /data/demo/
+/apps/studio/public/dist/
 /.agents/artifacts/
 /.agents/scratch/
 *.ot

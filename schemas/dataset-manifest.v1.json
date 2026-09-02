@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://transit-lab.local/schemas/dataset-manifest.v1.json",
+  "title": "Transit Lab dataset manifest v1",
+  "type": "object",
+  "required": ["schemaVersion", "datasetId", "fingerprint", "featureSchema", "snapshotIds", "split", "objectives"],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "datasetId": {"type": "string", "minLength": 1},
+    "fingerprint": {"type": "string", "minLength": 1},
+    "featureSchema": {"type": "string", "minLength": 1},
+    "snapshotIds": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+    "split": {"type": "object"},
+    "objectives": {"type": "object"},
+    "createdAt": {"type": "string", "format": "date-time"},
+    "producingRunId": {"type": ["string", "null"]},
+    "inputArtifacts": {"type": "array", "items": {"type": "object"}},
+    "counts": {"type": "object"}
+  },
+  "additionalProperties": true
+}

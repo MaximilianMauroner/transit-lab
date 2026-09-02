@@ -21,10 +21,3 @@ transit-graph = { path = "../transit-graph" }
 transit-labels = { path = "../transit-labels" }
 transit-model = { path = "../transit-model" }
 tch = { version = "0.18", optional = true }
-
-[dev-dependencies]
-gtfs-compile = { path = "../gtfs-compile" }
-gtfs-ingest = { path = "../gtfs-ingest" }
-tempfile.workspace = true
-transit-router = { path = "../transit-router" }
-transit-search = { path = "../transit-search" }

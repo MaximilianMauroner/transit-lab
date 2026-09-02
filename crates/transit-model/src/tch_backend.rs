@@ -122,7 +122,8 @@ pub struct TchRelationalAutoencoder {
     layers: Vec<RelationalLayer>,
     station_decoder: nn::Linear,
     line_decoder: nn::Linear,
-    indices: GraphIndices,
+    station_feature_width: usize,
+    line_feature_width: usize,
     device: Device,
 }
 
@@ -222,7 +223,8 @@ impl TchRelationalAutoencoder {
             layers,
             station_decoder,
             line_decoder,
-            indices: GraphIndices::from_graph(graph, device),
+            station_feature_width: graph.station_features.cols,
+            line_feature_width: graph.line_features.cols,
             device,
         }
     }
@@ -234,7 +236,22 @@ impl TchRelationalAutoencoder {
         train: bool,
     ) -> Result<TchReconstruction> {
         graph.validate()?;
+        if graph.station_features.cols != self.station_feature_width
+            || graph.line_features.cols != self.line_feature_width
+        {
+            anyhow::bail!(
+                "graph feature schema does not match the LibTorch model: station {} vs {}, line {} vs {}",
+                graph.station_features.cols,
+                self.station_feature_width,
+                graph.line_features.cols,
+                self.line_feature_width
+            );
+        }
         validate_mask(graph, mask)?;
+        // Relation indices belong to the input graph, not to the trainable
+        // model. Construct them per forward pass so one encoder can process
+        // Vienna, Berlin, and other graphs with different edge arrays.
+        let indices = GraphIndices::from_graph(graph, self.device);
         let station_static = matrix_tensor(&graph.station_features, self.device)?
             * visible_rows(&mask.station_rows, self.device);
         let line_static = matrix_tensor(&graph.line_features, self.device)?
@@ -291,24 +308,24 @@ impl TchRelationalAutoencoder {
         for layer in &self.layers {
             let station_to_line = mean_aggregate(
                 &station,
-                &self.indices.serves_src,
-                &self.indices.serves_dst,
+                &indices.serves_src,
+                &indices.serves_dst,
                 graph.manifest.line_count,
                 &layer.station_to_line,
                 Some(&served_mask),
             );
             let line_to_station = mean_aggregate(
                 &line,
-                &self.indices.serves_dst,
-                &self.indices.serves_src,
+                &indices.serves_dst,
+                &indices.serves_src,
                 graph.manifest.station_count,
                 &layer.line_to_station,
                 Some(&served_mask),
             );
             let transfer = mean_aggregate(
                 &station,
-                &self.indices.transfer_src,
-                &self.indices.transfer_dst,
+                &indices.transfer_src,
+                &indices.transfer_dst,
                 graph.manifest.station_count,
                 &layer.transfer,
                 Some(&transfer_mask),
@@ -317,9 +334,9 @@ impl TchRelationalAutoencoder {
                 station: &station,
                 line: &line,
                 edge_features: &graph.transit_features,
-                source_indices: &self.indices.transit_src,
-                destination_indices: &self.indices.transit_dst,
-                line_indices: &self.indices.transit_line,
+                source_indices: &indices.transit_src,
+                destination_indices: &indices.transit_dst,
+                line_indices: &indices.transit_line,
                 destination_count: graph.manifest.station_count,
                 station_projection: &layer.transit_station,
                 line_projection: &layer.transit_line,
@@ -329,8 +346,8 @@ impl TchRelationalAutoencoder {
             })?;
             let interchange = mean_aggregate(
                 &line,
-                &self.indices.interchange_src,
-                &self.indices.interchange_dst,
+                &indices.interchange_src,
+                &indices.interchange_dst,
                 graph.manifest.line_count,
                 &layer.interchange,
                 Some(&interchange_mask),
@@ -348,17 +365,12 @@ impl TchRelationalAutoencoder {
         let city = city_pool(&station, &line);
         let station_features = station.apply(&self.station_decoder);
         let line_features = line.apply(&self.line_decoder);
-        let served_by_logits = dot_rows(
-            &station,
-            &line,
-            &self.indices.serves_src,
-            &self.indices.serves_dst,
-        );
+        let served_by_logits = dot_rows(&station, &line, &indices.serves_src, &indices.serves_dst);
         let transfer_logits = dot_rows(
             &station,
             &station,
-            &self.indices.transfer_src,
-            &self.indices.transfer_dst,
+            &indices.transfer_src,
+            &indices.transfer_dst,
         );
         Ok(TchReconstruction {
             embeddings: TchEmbeddings {

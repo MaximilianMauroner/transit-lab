@@ -15,6 +15,21 @@ pub const TEMPORAL_CHANNELS: usize = 4;
 pub const EDGE_FEATURES: usize = 7;
 pub const TRANSFER_FEATURES: usize = 5;
 
+fn network_system_id(network: &CompiledNetwork) -> String {
+    let source = network.manifest.source_name.trim().to_ascii_lowercase();
+    let scope = network
+        .manifest
+        .geographical_scope
+        .trim()
+        .to_ascii_lowercase();
+    let source = if source.is_empty() || source == "unknown gtfs feed" {
+        network.manifest.source_path.trim().to_ascii_lowercase()
+    } else {
+        source
+    };
+    format!("{source}|{scope}")
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FeatureMatrix {
     pub rows: usize,
@@ -65,6 +80,11 @@ impl FeatureMatrix {
 pub struct GraphManifest {
     pub schema_version: String,
     pub snapshot_id: String,
+    /// Stable transport-system identity used only for cross-snapshot
+    /// supervision. It is deliberately separate from passenger-facing line
+    /// names and raw GTFS identifiers.
+    #[serde(default)]
+    pub network_system_id: String,
     pub station_count: usize,
     pub line_count: usize,
     pub transit_edge_count: usize,
@@ -91,6 +111,10 @@ pub struct GraphTensor {
     /// Passenger-facing labels for search and explanations. These strings
     /// are lookup metadata and are never included in model features.
     pub line_names: Vec<String>,
+    /// Stable canonical line identities from the compiler lookup table. An
+    /// absent value means this graph cannot contribute an identity positive;
+    /// metric training may still use an explicit pseudo-positive heuristic.
+    pub line_identities: Vec<String>,
     pub station_features: FeatureMatrix,
     pub station_temporal: FeatureMatrix,
     pub line_features: FeatureMatrix,
@@ -318,6 +342,7 @@ impl GraphTensor {
         let manifest = GraphManifest {
             schema_version: GRAPH_SCHEMA_VERSION.into(),
             snapshot_id: network.snapshot_id.clone(),
+            network_system_id: network_system_id(network),
             station_count: network.stations.len(),
             line_count: network.lines.len(),
             transit_edge_count: transit_src.len(),
@@ -343,6 +368,11 @@ impl GraphTensor {
                 .lines
                 .iter()
                 .map(|line| line.display_name.clone())
+                .collect(),
+            line_identities: network
+                .lines
+                .iter()
+                .map(|line| line.canonical_id.clone())
                 .collect(),
             station_features: feature_matrix_or_zeros(station_rows, station_feature_count)?,
             station_temporal,
@@ -395,6 +425,9 @@ impl GraphTensor {
         }
         if self.line_names.len() != self.manifest.line_count {
             bail!("graph line names do not match the manifest count");
+        }
+        if self.line_identities.len() != self.manifest.line_count {
+            bail!("graph line identities do not match the manifest count");
         }
         if self.station_features.cols != self.manifest.station_feature_names.len()
             || self.line_features.cols != self.manifest.line_feature_names.len()
@@ -641,6 +674,10 @@ impl GraphTensor {
             line_names: lookup_lines
                 .iter()
                 .map(|line| line.display_name.clone())
+                .collect(),
+            line_identities: lookup_lines
+                .iter()
+                .map(|line| line.canonical_id.clone())
                 .collect(),
             manifest,
         };
@@ -1075,6 +1112,7 @@ mod tests {
         let loaded = GraphTensor::load(directory.path()).unwrap();
         assert_eq!(loaded.manifest.snapshot_id, graph.manifest.snapshot_id);
         assert_eq!(loaded.line_names, graph.line_names);
+        assert_eq!(loaded.line_identities, graph.line_identities);
         assert_eq!(loaded.serves_src, graph.serves_src);
         assert_eq!(loaded.pattern_offsets, graph.pattern_offsets);
         assert_eq!(loaded.pattern_stops, graph.pattern_stops);

@@ -125,17 +125,6 @@ impl LineRepresentationSet {
         {
             bail!("line representation count does not match the graph");
         }
-        if let Some(first) = self.lines.first() {
-            let dimensions = first.dimensions();
-            if dimensions.contains(&0)
-                || self
-                    .lines
-                    .iter()
-                    .any(|line| line.dimensions() != dimensions)
-            {
-                bail!("line representation facets have inconsistent dimensions");
-            }
-        }
         if self.city.iter().any(|value| !value.is_finite())
             || self.lines.iter().any(|line| {
                 line.base

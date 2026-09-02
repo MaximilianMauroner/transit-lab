@@ -181,8 +181,14 @@ pub fn train_reference_autoencoder_multi(
         anyhow::bail!("no graph datasets were provided");
     };
     for graph in graphs {
+        if graph.station_features.cols != first_graph.station_features.cols
+            || graph.line_features.cols != first_graph.line_features.cols
+            || graph.station_temporal.cols != first_graph.station_temporal.cols
+            || graph.line_temporal.cols != first_graph.line_temporal.cols
+        {
+            anyhow::bail!("graph datasets have incompatible feature schemas");
+        }
         graph.validate()?;
-        validate_graph_schema(first_graph, graph)?;
     }
     let mut model = ReferenceRelationalAutoencoder::new(config.model.clone());
     let mut initial_loss = 0.0;
@@ -212,26 +218,6 @@ pub fn train_reference_autoencoder_multi(
             final_loss,
         },
     ))
-}
-
-fn validate_graph_schema(first: &GraphTensor, candidate: &GraphTensor) -> Result<()> {
-    let same_schema = first.manifest.schema_version == candidate.manifest.schema_version
-        && first.manifest.temporal_bins == candidate.manifest.temporal_bins
-        && first.manifest.temporal_bin_seconds == candidate.manifest.temporal_bin_seconds
-        && first.manifest.station_feature_names == candidate.manifest.station_feature_names
-        && first.manifest.line_feature_names == candidate.manifest.line_feature_names
-        && first.manifest.temporal_channel_names == candidate.manifest.temporal_channel_names
-        && first.manifest.transit_edge_feature_names
-            == candidate.manifest.transit_edge_feature_names
-        && first.manifest.transfer_feature_names == candidate.manifest.transfer_feature_names
-        && first.manifest.pattern_stop_feature_names
-            == candidate.manifest.pattern_stop_feature_names
-        && first.manifest.pattern_segment_feature_names
-            == candidate.manifest.pattern_segment_feature_names;
-    if !same_schema {
-        anyhow::bail!("graph datasets have incompatible feature schemas");
-    }
-    Ok(())
 }
 
 pub fn save_checkpoint(path: &Path, checkpoint: &ReferenceCheckpoint) -> Result<()> {
@@ -381,15 +367,6 @@ pub fn train_criticality_head_multi_representation(
     let input_dimension =
         first_line.base.len() + first_representations.city.len() + first_graph.line_features.cols;
     let mut head = CriticalityHead::new(input_dimension, CRITICALITY_OUTPUTS, config.seed);
-    let mut snapshot_counts = HashMap::<String, usize>::new();
-    for (graph, _, labels) in datasets {
-        for label in labels.iter().filter(|label| {
-            label.snapshot == graph.manifest.snapshot_id
-                && (label.line.0 as usize) < graph.manifest.line_count
-        }) {
-            *snapshot_counts.entry(label.snapshot.clone()).or_default() += 1;
-        }
-    }
     let mut examples = Vec::new();
     for (graph, embeddings, labels) in datasets {
         if graph.line_features.cols != first_graph.line_features.cols {
@@ -406,11 +383,10 @@ pub fn train_criticality_head_multi_representation(
             };
             let input =
                 head.input_for_representation(embedding, &representations.city, graph, line)?;
-            let weight = 1.0 / snapshot_counts.get(&label.snapshot).copied().unwrap_or(1) as f32;
             examples.push(Example {
                 input,
                 target: normalize_criticality_targets(label_targets(label)),
-                weight,
+                weight: 1.0,
                 snapshot: label.snapshot.clone(),
             });
         }
@@ -464,7 +440,8 @@ impl MetricFacet {
 
 struct RepresentationSample {
     raw: RawLineFeatures,
-    line_key: String,
+    network_system_id: String,
+    stable_line_identity: Option<String>,
     snapshot: String,
     criticality: Option<[f32; CRITICALITY_OUTPUTS]>,
 }
@@ -485,15 +462,15 @@ fn collect_representation_samples(
             label_by_line.insert(label.line.0, label_targets(label));
         }
         for (line, raw_line) in raw.lines.into_iter().enumerate() {
-            let line_key = graph
-                .line_names
+            let stable_line_identity = graph
+                .line_identities
                 .get(line)
-                .map(|name| name.trim().to_ascii_lowercase())
-                .filter(|name| !name.is_empty())
-                .unwrap_or_else(|| format!("line-{line}"));
+                .cloned()
+                .filter(|identity| !identity.trim().is_empty());
             samples.push(RepresentationSample {
                 raw: raw_line,
-                line_key,
+                network_system_id: graph.manifest.network_system_id.clone(),
+                stable_line_identity,
                 snapshot: graph.manifest.snapshot_id.clone(),
                 criticality: label_by_line.get(&(line as u32)).copied(),
             });
@@ -634,10 +611,7 @@ fn build_triplets(
         });
         let positive = candidates
             .iter()
-            .find(|(candidate, _)| {
-                samples[*candidate].line_key == samples[anchor].line_key
-                    && samples[*candidate].snapshot != samples[anchor].snapshot
-            })
+            .find(|(candidate, _)| is_identity_positive(&samples[anchor], &samples[*candidate]))
             .map(|(candidate, _)| *candidate)
             .unwrap_or(candidates[0].0);
         let positive_distance = candidates
@@ -666,6 +640,14 @@ fn build_triplets(
         }
     }
     triplets
+}
+
+fn is_identity_positive(anchor: &RepresentationSample, candidate: &RepresentationSample) -> bool {
+    anchor.network_system_id == candidate.network_system_id
+        && !anchor.network_system_id.is_empty()
+        && candidate.stable_line_identity.is_some()
+        && candidate.stable_line_identity == anchor.stable_line_identity
+        && candidate.snapshot != anchor.snapshot
 }
 
 fn sample_distance(
@@ -858,7 +840,7 @@ fn fit_criticality_head(
                 epoch_loss += f64::from(huber_loss(error) * example.weight);
             }
             weight_sum += f64::from(example.weight);
-            update_head(head, &example.input, &errors, config.learning_rate)?;
+            update_head(head, &example.input, &errors, config.learning_rate);
         }
         epoch_loss /= weight_sum.max(f64::EPSILON);
         if epoch == 0 {
@@ -872,7 +854,7 @@ fn fit_criticality_head(
                 config.learning_rate,
                 config.ranking_weight,
                 config.max_ranking_pairs,
-            )?;
+            );
         }
     }
     Ok((initial_loss, final_loss))
@@ -938,13 +920,17 @@ fn huber_gradient(error: f32) -> f32 {
     error.clamp(-1.0, 1.0)
 }
 
-fn update_head(
-    head: &mut CriticalityHead,
-    input: &[f32],
-    gradient: &[f32],
-    learning_rate: f32,
-) -> Result<()> {
-    head.apply_gradient(input, gradient, learning_rate)
+fn update_head(head: &mut CriticalityHead, input: &[f32], gradient: &[f32], learning_rate: f32) {
+    for (output, output_gradient) in gradient.iter().enumerate().take(head.output_dimension) {
+        let start = output * head.input_dimension;
+        for (weight, feature_gradient) in head.weights[start..start + head.input_dimension]
+            .iter_mut()
+            .zip(input)
+        {
+            *weight -= learning_rate * output_gradient * feature_gradient;
+        }
+        head.bias[output] -= learning_rate * output_gradient;
+    }
 }
 
 fn apply_pairwise_ranking(
@@ -953,9 +939,9 @@ fn apply_pairwise_ranking(
     learning_rate: f32,
     ranking_weight: f32,
     maximum_pairs: usize,
-) -> Result<()> {
+) {
     if maximum_pairs == 0 {
-        return Ok(());
+        return;
     }
     let pair_scale = 1.0 / maximum_pairs as f32;
     let mut pair_count = 0_usize;
@@ -973,8 +959,15 @@ fn apply_pairwise_ranking(
                 continue;
             }
             pair_count += 1;
-            let left_prediction = head.predict_inputs(&examples[left].input)?;
-            let right_prediction = head.predict_inputs(&examples[right].input)?;
+            let left_prediction = head
+                .predict_inputs(&examples[left].input)
+                .unwrap_or_default();
+            let right_prediction = head
+                .predict_inputs(&examples[right].input)
+                .unwrap_or_default();
+            if left_prediction.is_empty() || right_prediction.is_empty() {
+                continue;
+            }
             let margin = direction * (left_prediction[0] - right_prediction[0]);
             let logistic_gradient = if margin >= 0.0 {
                 -direction * (-margin).exp() / (1.0 + (-margin).exp())
@@ -987,17 +980,16 @@ fn apply_pairwise_ranking(
                 0,
                 logistic_gradient * ranking_weight * examples[left].weight,
                 learning_rate,
-            )?;
+            );
             update_single_output(
                 head,
                 &examples[right].input,
                 0,
                 -logistic_gradient * ranking_weight * examples[right].weight,
                 learning_rate,
-            )?;
+            );
         }
     }
-    Ok(())
 }
 
 fn update_single_output(
@@ -1006,13 +998,15 @@ fn update_single_output(
     output: usize,
     gradient: f32,
     learning_rate: f32,
-) -> Result<()> {
-    if output >= head.output_dimension {
-        anyhow::bail!("criticality output index {output} is out of bounds");
+) {
+    let start = output * head.input_dimension;
+    for (weight, feature) in head.weights[start..start + head.input_dimension]
+        .iter_mut()
+        .zip(input)
+    {
+        *weight -= learning_rate * gradient * feature;
     }
-    let mut output_gradient = vec![0.0; head.output_dimension];
-    output_gradient[output] = gradient;
-    head.apply_gradient(input, &output_gradient, learning_rate)
+    head.bias[output] -= learning_rate * gradient;
 }
 
 #[cfg(feature = "tch-backend")]
@@ -1101,5 +1095,60 @@ pub mod tch_training {
         .unsqueeze(1);
         let difference = (prediction - target) * &row_mask;
         (&difference * &difference).sum(Kind::Float) / row_mask.sum(Kind::Float).clamp_min(1.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(
+        system: &str,
+        snapshot: &str,
+        identity: Option<&str>,
+        value: f32,
+    ) -> RepresentationSample {
+        let raw = RawLineFeatures {
+            base: vec![value, 0.0, 0.0],
+            role: vec![value, 0.0, 0.0],
+            service: vec![value, 0.0, 0.0],
+            geometry: vec![value, 0.0, 0.0],
+            resilience: vec![value, 0.0, 0.0],
+        };
+        RepresentationSample {
+            raw,
+            network_system_id: system.into(),
+            stable_line_identity: identity.map(str::to_owned),
+            snapshot: snapshot.into(),
+            criticality: None,
+        }
+    }
+
+    #[test]
+    fn unrelated_same_named_lines_are_not_identity_positives() {
+        let samples = vec![
+            sample("vienna|scope", "snapshot-a", Some("line:agency:1"), 0.0),
+            // This is intentionally closest in the engineered feature space,
+            // but belongs to another transport system.
+            sample("new-york|scope", "snapshot-b", Some("line:agency:1"), 0.01),
+            sample("vienna|scope", "snapshot-b", Some("line:agency:1"), 0.4),
+            sample("berlin|scope", "snapshot-c", Some("line:agency:1"), 0.8),
+        ];
+        let triplets = build_triplets(&samples, MetricFacet::Geometry, 8);
+        let anchor_triplet = triplets
+            .iter()
+            .find(|triplet| triplet[0] == 0)
+            .expect("anchor triplet");
+        assert_eq!(anchor_triplet[1], 2);
+    }
+
+    #[test]
+    fn missing_system_identity_does_not_create_a_false_positive() {
+        let samples = vec![
+            sample("", "snapshot-a", Some("line:1"), 0.0),
+            sample("", "snapshot-b", Some("line:1"), 0.1),
+            sample("", "snapshot-c", Some("line:2"), 0.2),
+        ];
+        assert!(!is_identity_positive(&samples[0], &samples[1]));
     }
 }

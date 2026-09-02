@@ -2014,6 +2014,7 @@ name = "transit-dataset"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "serde",
  "serde_json",
  "transit-domain",
@@ -2133,19 +2134,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
- "gtfs-compile",
- "gtfs-ingest",
  "serde",
  "serde_json",
  "serde_yaml",
  "tch",
- "tempfile",
  "transit-domain",
  "transit-graph",
  "transit-labels",
  "transit-model",
- "transit-router",
- "transit-search",
 ]
 
 [[package]]

@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#101719" />
+    <meta name="description" content="Transit Lab Studio: inspect networks, runs, artifacts, and model lineage." />
+    <title>Transit Lab Studio</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <a class="brand" href="/" data-route="overview" aria-label="Transit Lab Studio overview">
+          <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+          <span>Transit Lab <em>Studio</em></span>
+        </a>
+        <p class="sidebar-label">Workspace</p>
+        <nav class="primary-nav" aria-label="Primary navigation">
+          <a href="/" data-route="overview"><span class="nav-icon">⌂</span>Overview</a>
+          <a href="/data" data-route="data"><span class="nav-icon">▦</span>Data &amp; lineage</a>
+          <a href="/runs" data-route="runs"><span class="nav-icon">↗</span>Runs</a>
+          <a href="/network" data-route="network"><span class="nav-icon">◎</span>Network</a>
+          <a href="/criticality" data-route="criticality"><span class="nav-icon">⌁</span>Criticality</a>
+          <a href="/similarity" data-route="similarity"><span class="nav-icon">≋</span>Similarity</a>
+        </nav>
+        <p class="sidebar-label secondary-label">Analysis</p>
+        <nav class="primary-nav" aria-label="Analysis navigation">
+          <a href="/embeddings" data-route="embeddings"><span class="nav-icon">◌</span>Embeddings</a>
+          <a href="/evaluation" data-route="evaluation"><span class="nav-icon">▤</span>Evaluation</a>
+        </nav>
+        <div class="sidebar-footer">
+          <span class="connection-dot" aria-hidden="true"></span>
+          <span><strong>Local workspace</strong><small id="sidebar-status">Connecting…</small></span>
+        </div>
+      </aside>
+      <main class="main-content">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow" id="route-kicker">Control plane</p>
+            <h1 id="route-title">Overview</h1>
+          </div>
+          <div class="topbar-actions">
+            <span class="read-only-badge"><span class="live-dot"></span> Rust artifacts indexed</span>
+            <button class="button button-quiet" id="refresh-button" type="button">Refresh index</button>
+          </div>
+        </header>
+        <section id="view" aria-live="polite"></section>
+      </main>
+    </div>
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+    <script type="module" src="/client/app.js"></script>
+  </body>
+</html>

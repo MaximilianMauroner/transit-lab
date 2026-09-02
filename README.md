@@ -1,34 +1,86 @@
 # Transit Lab
 
-Transit Lab is a Rust-first GTFS graph learning pipeline. It compiles a
-service-day snapshot into canonical station, line, pattern, and timetable data;
-runs timetable-aware line-removal simulations; and exposes a masked relational
-graph autoencoder interface for representation learning.
+Transit Lab is a Rust-first GTFS research workspace with a local-first Build
+and Explore application. It compiles service-day snapshots into canonical
+station, line, pattern, and timetable data; simulates line disruptions; and
+stores the provenance needed to compare results safely.
 
-The repository is intentionally staged around a small, testable vertical slice:
+The current control plane is deliberately small and runnable on one machine:
 
-1. Parse a GTFS directory or ZIP.
-2. Select active service for one date and preserve GTFS times beyond 24:00.
-3. Canonicalize physical stations, passenger-facing lines, and trip patterns.
-4. Materialize compact graph arrays and a JSON manifest.
-5. Run a RAPTOR-style one-to-all router with line masks.
-6. Generate aggregate single-line disruption labels in parallel.
-7. Produce a shared base line embedding plus separate general, network-role,
-   service, geometry, and resilience facets.
-8. Retrieve comparable lines across snapshots with measured comparison fields.
-9. Run the reference Rust model path, or enable the optional LibTorch backend.
+```text
+Browser → Bun API → SQLite metadata + filesystem artifacts
+                       ↓
+                    Bun worker → Rust CLI
+```
+
+The API serves the browser, and the separate worker claims queued runs from
+the same SQLite database. Every run, event, and artifact is versioned by a
+stable fingerprint. PostgreSQL, S3-compatible storage, and remote workers can
+be added behind these boundaries later.
+
+## Current status
+
+The dependency-free Rust reference path is operational for GTFS compilation,
+ordered graph construction, timetable-aware line-removal labels, separate
+line similarity facets, criticality inference, and cross-snapshot identity
+pairing. The Bun API, worker, artifact manifests, dataset manifests, SSE run
+events, line/network explorers, and provenance views are implemented.
+
+Dataset and evaluation artifacts are currently indexed and displayed as
+read-only results. The worker does not submit `build-dataset` or `evaluate`
+runs until the Rust CLI exposes stable commands and output contracts for them;
+it rejects those kinds explicitly rather than inventing a fallback.
+
+The optional LibTorch graph model has a differentiable forward path and a
+small masked reconstruction training helper, but the end-to-end GPU
+multi-task CLI, held-out cross-city retrieval benchmark, and validated
+criticality generalization are still pending. Reference-model outputs are
+useful for pipeline verification; they are not evidence of production model
+quality.
 
 ## Quick start
 
-Install Rust 1.75 or newer, then run:
+Install Rust 1.75 or newer and Bun, then run the checks and generate the
+deterministic demo corpus:
 
 ```bash
 cargo test --workspace
+bun test apps/studio packages display web-wrapper
 cargo run -p transit-cli -- demo --output data/demo
 ```
 
-The demo command builds a deterministic synthetic network, generates line
-removal labels, and writes a graph plus label manifest under `data/demo`.
+Start the active API/web application from the repository root. It serves the
+browser interface at <http://localhost:3000>; run the worker in a second
+terminal:
+
+```bash
+bun run api
+bun run worker
+```
+
+`bun run web` is an alias for the API/web server. The older Studio server is
+still available with `bun run studio` while the two implementations converge.
+
+The worker never accepts arbitrary shell commands; it maps validated run specs
+to an allow-listed Rust argument array.
+
+Useful configuration variables are:
+
+```text
+PORT                    API port, default 3000
+TRANSIT_LAB_ROOT        repository root, default current repository
+TRANSIT_LAB_DATA_ROOT   artifact/data directory, default data
+TRANSIT_LAB_DB          SQLite file, default data/transit-lab.sqlite
+TRANSIT_LAB_WORKER_ID   optional worker identity
+```
+
+Health and overview endpoints are available at `/health`, `/api/health`, and
+`/api/overview`. The overview reports indexed artifacts and run status rather
+than a manually entered progress percentage. Set `TRANSIT_LAB_DATA_ROOT` and
+`TRANSIT_LAB_DB` together when keeping metadata and artifacts outside the
+repository.
+
+## Rust pipeline
 
 For a real feed:
 
@@ -40,137 +92,84 @@ cargo run -p transit-cli -- graph build \
   --snapshot data/snapshots/example --output data/graphs/example
 cargo run -p transit-cli -- labels line-removal \
   --snapshot data/snapshots/example --output data/labels/example.jsonl
-
-# Compare a line against another compiled graph
-cargo run -p transit-cli -- similar-lines \
-  --query-graph data/graphs/vienna \
-  --query-line U2 \
-  --candidate-graph data/graphs/berlin \
-  --profile network-role --top-k 10
 ```
 
-### Multi-task training
+The compiler preserves GTFS times beyond 24:00, selects active service for a
+date, canonicalizes physical stations and passenger-facing lines, retains
+ordered route patterns, and materializes compact graph arrays. Label origins
+use seeded geographic spread, interchange coverage, and uniform sampling;
+the sampling policy is fingerprinted beside the labels. `verify top-lines`
+simulates only the selected predicted lines.
 
-Compile one graph per feed or snapshot, then pass all graphs to the shared
-training command. Labels are optional for representation pretraining and line
-retrieval; supply one JSONL file per graph to train the disruption-impact head.
-The label files follow the graph order.
-
-```bash
-cargo run -p transit-cli -- train multitask \
-  --graph data/graphs/vienna \
-  --graph data/graphs/vbb \
-  --labels data/labels/vienna.jsonl \
-  --labels data/labels/vbb.jsonl \
-  --config configs/models/multitask-v1.yaml \
-  --output data/models/multitask-v1.json
-
-cargo run -p transit-cli -- infer criticality \
-  --graph data/graphs/vbb \
-  --model data/models/multitask-v1.json \
-  --output data/runs/vbb-predictions.json
-
-cargo run -p transit-cli -- similar-lines \
-  --query-graph data/graphs/vienna \
-  --query-line U2 \
-  --candidate-graph data/graphs/vbb \
-  --encoder data/models/multitask-v1.json \
-  --profile network-role --top-k 10
-```
-
-The command is also available as `train representation`. To retrieve by a
-different meaning, use `service`, `geometry`, `resilience`, or `general`. A
-weighted profile takes role, service, geometry, and resilience weights in that
-order:
+The CLI can compare separate facet spaces:
 
 ```bash
 cargo run -p transit-cli -- similar-lines \
   --query-graph data/graphs/vienna --query-line U2 \
-  --candidate-graph data/graphs/vbb \
-  --encoder data/models/multitask-v1.json \
-  --profile weighted:0.5,0.2,0.2,0.1
+  --candidate-graph data/graphs/berlin \
+  --profile network-role --top-k 10
 ```
 
-If individual `--*-weight` flags are used, omitted facets receive weight zero.
-The output includes every facet score and measured comparison fields, so the
-neural score is not the explanation.
+Available profiles are `network-role`, `service`, `geometry`, `resilience`,
+`general`, and explicit weighted profiles. Measured feature differences are
+returned with the scores so a neural or reference similarity value is not
+presented as an explanation.
 
-For the checked-in feed registry, `fetch` stores an immutable ZIP and
-`source.json` under `data/raw/<feed>/<sha256>/`. Compile the ZIP inside that
-directory so the source metadata is carried into the snapshot:
+## Transit Lab Studio
 
-```bash
-cargo run -p transit-cli -- fetch vienna --output data/raw
-cargo run -p transit-cli -- compile \
-  --input data/raw/vienna/<sha256>/gtfs.zip \
-  --service-date 2026-09-09 \
-  --output data/snapshots/vienna
-cargo run -p transit-cli -- graph build \
-  --snapshot data/snapshots/vienna --output data/graphs/vienna
-cargo run -p transit-cli -- labels line-removal \
-  --snapshot data/snapshots/vienna --output data/labels/vienna.jsonl
+The persistent navigation is split into the routes currently shipped by the
+Studio:
+
+```text
+BUILD     Overview · Data & lineage · Runs
+EXPLORE   Network · Criticality · Similarity · Embeddings · Evaluation
 ```
 
-Label generation is exact timetable simulation and can be the expensive step.
-Reduce `--origins` and `--departure-times` for a smoke run, or use several
-dates and feeds for snapshot-consistency training.
+Datasets and model lineage are panels in `Data & lineage`, rather than
+separate routes. All visible results carry network, snapshot, service
+date/profile, model, and facet context where applicable. Studio indexes
+existing files under `data/` on startup, including feed metadata, compiled
+snapshots, graphs, labels, models, predictions, artifact manifests, and
+dataset manifests.
 
-The responsive web wrapper is under [`web-wrapper`](web-wrapper). Start it
-with `bun run dev`, then load the JSON emitted by `infer criticality` or use a
-prediction API URL. It displays ranked impact, all disruption metrics,
-structural uniqueness, and line names while ignoring the optional embedding
-payload.
+Run tracking uses SQLite transactions for atomic claims and server-sent events
+for reconnectable progress. Rust stdout/stderr are retained as diagnostics;
+machine events are written as versioned JSONL and validated before entering
+the run ledger. Artifact and dataset manifests are immutable and retain input
+fingerprints instead of deleting superseded outputs.
 
-The interactive 3D graph display is under [`display`](display). Start it with
-`bun run dev` from that directory to inspect compiled snapshots, isolate lines,
-orbit the network, and compare station and service metrics across feeds. It
-prefers a local Vienna snapshot when one is present, then falls back to
-`data/demo/snapshot/network.json`. You can also choose a local snapshot folder
-containing `network.json`.
+The older [`display`](display) and [`web-wrapper`](web-wrapper) viewers remain
+temporarily while their network and criticality capabilities reach parity in
+Studio. They are not additional Studio data sources.
 
-The `tch-backend` feature is optional because LibTorch is not bundled in the
-repository. Enable it on a Linux/NVIDIA machine with a compatible LibTorch
-installation:
+## Data contracts and provenance
+
+The versioned boundary contracts are:
+
+```text
+schemas/run-event.v1.json
+schemas/artifact-manifest.v1.json
+schemas/dataset-manifest.v1.json
+schemas/inference-result.v1.json
+```
+
+Snapshot, dataset, model, and inference fingerprints include their upstream
+inputs and configuration. Raw GTFS IDs and operator strings remain lookup
+metadata; normalized numeric features are used for model inputs to reduce
+feed-producer and city-name leakage.
+
+Generated data is ignored by Git. Do not commit downloaded feeds, SQLite
+databases, checkpoints, or other files under the ignored `data/` paths.
+
+## Optional LibTorch backend
+
+LibTorch is not bundled. On a compatible Linux/NVIDIA machine, compile the
+feature-gated code with:
 
 ```bash
 LIBTORCH=/opt/libtorch cargo build -p transit-model --features tch-backend
 ```
 
-The default reference model is dependency-free and deterministic. It is useful
-for smoke tests, structural scores, and data-pipeline validation; it is not a
-replacement for GPU training.
-
-## Data contracts
-
-Snapshot manifests record source hashes, selected service date, scope, station
-merge policy, line grouping policy, compiler version, and validation details.
-Compiled snapshots are immutable by convention: changing any of those inputs
-creates a new snapshot directory and ID.
-
-Raw IDs and operator strings remain in lookup/manifest data only. Model feature
-arrays use normalized numeric values and mode indicators to reduce feed-producer
-and city-name leakage.
-
-Graph manifests currently use schema `station-line-relational-v2`. In addition
-to the station, line, timetable, and relation arrays, each graph stores ordered
-canonical route patterns as CSR-like arrays:
-
-```text
-pattern_offsets.u32          pattern_stops.u32
-pattern_lines.u32            pattern_directions.u32
-pattern_trip_counts.u32      pattern_stop_features.f32
-pattern_segment_features.f32
-```
-
-`pattern_offsets[p]..pattern_offsets[p + 1]` indexes the ordered stops and
-stop features for pattern `p`; segment rows follow the same order. This is the
-sequence input used by the pattern encoder and preserves direction, branch,
-pickup, and drop-off information that a station-line bipartite graph alone
-would lose. Graphs supplied to one multitask run must have compatible feature
-schemas. The `lookup_*.json` files retain display metadata for explanations but
-are not model inputs.
-
-The default `reference-cpu-multitask` backend is deterministic and dependency
-free. It is intended to validate the graph, training, checkpoint, and retrieval
-workflow on a CPU. The optional LibTorch backend remains the path for a fully
-trainable neural encoder and GPU-scale runs.
+This enables the differentiable relational model modules. It does not yet
+make the default CLI a complete GPU multi-task training/evaluation workflow;
+that remains an explicit next implementation stage.
