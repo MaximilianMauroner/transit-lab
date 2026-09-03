@@ -66,6 +66,98 @@ pub struct DatasetEntry {
     pub split: String,
 }
 
+/// A dataset partition that can be supplied to a training or evaluation
+/// loader.  The string form is part of the on-disk manifest contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DatasetSplit {
+    Train,
+    Validation,
+    Test,
+}
+
+impl DatasetSplit {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim() {
+            "train" => Ok(Self::Train),
+            "validation" => Ok(Self::Validation),
+            "test" => Ok(Self::Test),
+            value => {
+                anyhow::bail!("dataset split must be train, validation, or test; got {value:?}")
+            }
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Train => "train",
+            Self::Validation => "validation",
+            Self::Test => "test",
+        }
+    }
+}
+
+impl DatasetManifest {
+    /// Return only manifest entries assigned to `split`.
+    pub fn entries_for_split(&self, split: DatasetSplit) -> Vec<&DatasetEntry> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.split == split.as_str())
+            .collect()
+    }
+
+    /// Validate the partition boundary for a research dataset.
+    ///
+    /// A complete transport system is the unit of partitioning.  Multiple
+    /// snapshots of one system may share a partition, but no system may occur
+    /// in more than one partition.  All three partitions must be non-empty so
+    /// a caller cannot accidentally turn a named split strategy into an
+    /// all-training dataset.
+    pub fn validate_split_integrity(&self) -> Result<()> {
+        validate_split_integrity(&self.entries, true)
+    }
+}
+
+fn validate_split_integrity(entries: &[DatasetEntry], require_all_splits: bool) -> Result<()> {
+    if entries.is_empty() {
+        anyhow::bail!("dataset split integrity requires explicit dataset entries");
+    }
+
+    let mut systems = BTreeMap::<&str, &str>::new();
+    let mut counts = BTreeMap::<&str, usize>::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let split = DatasetSplit::parse(&entry.split)
+            .with_context(|| format!("validating dataset entry {index} split"))?;
+        if entry.network_system_id.trim().is_empty() {
+            anyhow::bail!(
+                "dataset entry {index} network system ID is required for split integrity"
+            );
+        }
+        if let Some(previous) = systems.insert(entry.network_system_id.as_str(), split.as_str()) {
+            if previous != split.as_str() {
+                anyhow::bail!(
+                    "network system {:?} appears in both {previous} and {} partitions",
+                    entry.network_system_id,
+                    split.as_str()
+                );
+            }
+        }
+        *counts.entry(split.as_str()).or_default() += 1;
+    }
+
+    if require_all_splits
+        && [
+            DatasetSplit::Train,
+            DatasetSplit::Validation,
+            DatasetSplit::Test,
+        ]
+        .into_iter()
+        .any(|split| counts.get(split.as_str()).copied().unwrap_or(0) == 0)
+    {
+        anyhow::bail!("dataset split must contain at least one train, validation, and test entry");
+    }
+    Ok(())
+}
+
 /// An already materialized graph and its immutable simulator labels. The
 /// output paths are part of the dataset identity, so a caller can copy the
 /// graph and label files before writing the manifest.
@@ -182,6 +274,7 @@ pub fn create_dataset_manifest(
             split: part.split.clone(),
         })
         .collect::<Vec<_>>();
+    validate_split_integrity(&entries, true)?;
     let mut snapshots = std::collections::BTreeSet::new();
     if entries
         .iter()
@@ -370,9 +463,7 @@ fn validate_label_rows(
 }
 
 fn validate_split(split: &str, field: &str) -> Result<()> {
-    if !matches!(split, "train" | "validation" | "test") {
-        anyhow::bail!("{field} must be train, validation, or test");
-    }
+    DatasetSplit::parse(split).with_context(|| format!("{field} is invalid"))?;
     Ok(())
 }
 
@@ -529,12 +620,52 @@ pub struct LoadedDatasetCollection {
 }
 
 pub fn load_dataset_collection(directory: &Path) -> Result<LoadedDatasetCollection> {
+    load_dataset_collection_filtered(directory, None)
+}
+
+/// Load only one manifest partition.  The manifest and all entry metadata are
+/// validated, but graph and label payloads for the other partitions are never
+/// opened.  This is the training boundary: validation and test labels cannot
+/// reach a training session through this API.
+pub fn load_dataset_split(
+    directory: &Path,
+    split: DatasetSplit,
+) -> Result<LoadedDatasetCollection> {
+    let collection = load_dataset_collection_filtered(directory, Some(split))?;
+    if collection.entries.is_empty() {
+        anyhow::bail!(
+            "dataset has no graph entries in the {} split",
+            split.as_str()
+        );
+    }
+    Ok(collection)
+}
+
+impl LoadedDatasetCollection {
+    pub fn entries_for_split(&self, split: DatasetSplit) -> Vec<&LoadedDataset> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.split == split.as_str())
+            .collect()
+    }
+}
+
+fn load_dataset_collection_filtered(
+    directory: &Path,
+    requested_split: Option<DatasetSplit>,
+) -> Result<LoadedDatasetCollection> {
     let manifest = load_manifest(directory)?;
     let legacy_layout = manifest.entries.is_empty()
         || (manifest.entries.len() == 1
             && manifest.examples_file.is_none()
             && manifest.input_artifacts.is_empty()
             && manifest.split == serde_json::json!({"strategy": "snapshot"}));
+    if requested_split.is_some() && legacy_layout {
+        anyhow::bail!("dataset training requires explicit train, validation, and test entries");
+    }
+    if !legacy_layout {
+        manifest.validate_split_integrity()?;
+    }
     let raw_entries = if manifest.entries.is_empty() {
         if manifest.snapshot_ids.len() != 1
             || manifest.snapshot_id.trim().is_empty()
@@ -582,7 +713,10 @@ pub fn load_dataset_collection(directory: &Path) -> Result<LoadedDatasetCollecti
     }
     let mut entries = Vec::with_capacity(raw_entries.len());
     let mut graph_pairs = Vec::with_capacity(raw_entries.len());
-    for entry in &raw_entries {
+    for entry in raw_entries.iter().filter(|entry| match requested_split {
+        Some(split) => entry.split == split.as_str(),
+        None => true,
+    }) {
         let loaded = load_dataset_entry(
             directory,
             &manifest,
@@ -606,8 +740,17 @@ pub fn load_dataset_collection(directory: &Path) -> Result<LoadedDatasetCollecti
             anyhow::bail!("single-entry dataset manifest has inconsistent legacy fields");
         }
     }
-    validate_examples(directory, &manifest, &graph_pairs)?;
-    let labels = &entries[0].labels;
+    // A split-specific load intentionally does not open examples.json.  Its
+    // rows contain targets for every partition and are not part of the
+    // training input boundary.  A full load still validates the examples
+    // against every graph for evaluation and inventory checks.
+    if requested_split.is_none() {
+        validate_examples(directory, &manifest, &graph_pairs)?;
+    }
+    let labels = entries
+        .first()
+        .map(|entry| entry.labels.as_slice())
+        .unwrap_or(&[]);
     let expected_fingerprint = if legacy_layout {
         legacy_manifest_fingerprint(&manifest, labels)?
     } else {
@@ -661,6 +804,43 @@ mod tests {
             .collect()
     }
 
+    fn manifest_entry(snapshot: &str, system: &str, split: &str) -> DatasetEntry {
+        DatasetEntry {
+            snapshot_id: snapshot.into(),
+            network_system_id: system.into(),
+            graph_directory: format!("graphs/{split}"),
+            label_file: format!("labels/{split}.jsonl"),
+            label_count: 0,
+            split: split.into(),
+        }
+    }
+
+    fn research_manifest(entries: Vec<DatasetEntry>) -> DatasetManifest {
+        DatasetManifest {
+            schema_version: 1,
+            dataset_id: "dataset-test".into(),
+            fingerprint: "0".repeat(64),
+            feature_schema: "station-line-relational-v2".into(),
+            snapshot_ids: entries
+                .iter()
+                .map(|entry| entry.snapshot_id.clone())
+                .collect(),
+            split: serde_json::json!({"strategy": "system-level"}),
+            objectives: serde_json::json!({}),
+            created_at: String::new(),
+            producing_run_id: None,
+            input_artifacts: Vec::new(),
+            snapshot_id: String::new(),
+            graph_schema_version: "station-line-relational-v2".into(),
+            label_count: 0,
+            label_file: String::new(),
+            graph_directory: String::new(),
+            entries,
+            examples_file: None,
+            example_count: 0,
+        }
+    }
+
     #[test]
     fn saved_dataset_round_trips_with_manifest_integrity_checks() {
         let (network, graph) = fixture();
@@ -708,5 +888,121 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("fingerprint"));
+    }
+
+    #[test]
+    fn split_integrity_requires_complete_system_partitions() {
+        let manifest = research_manifest(vec![
+            manifest_entry("vienna-2026-01", "vienna", "train"),
+            manifest_entry("berlin-2026-01", "berlin", "validation"),
+            manifest_entry("prague-2026-01", "prague", "test"),
+        ]);
+        assert_eq!(
+            manifest
+                .entries_for_split(DatasetSplit::Train)
+                .into_iter()
+                .map(|entry| entry.snapshot_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["vienna-2026-01"]
+        );
+        manifest.validate_split_integrity().unwrap();
+
+        let mut leaking = manifest.clone();
+        leaking.entries[2].network_system_id = "vienna".into();
+        let error = leaking.validate_split_integrity().unwrap_err();
+        assert!(error.to_string().contains("network system"));
+
+        let incomplete =
+            research_manifest(vec![manifest_entry("vienna-2026-01", "vienna", "train")]);
+        let error = incomplete.validate_split_integrity().unwrap_err();
+        assert!(error.to_string().contains("train, validation, and test"));
+    }
+
+    #[test]
+    fn split_loader_does_not_open_labels_from_other_partitions() {
+        let (network, graph) = fixture();
+        let directory = tempfile::tempdir().unwrap();
+        let mut train_graph = graph.clone();
+        train_graph.manifest.snapshot_id = "snapshot-train".into();
+        train_graph.manifest.network_system_id = "system-train".into();
+        let mut validation_graph = train_graph.clone();
+        validation_graph.manifest.snapshot_id = "snapshot-validation".into();
+        validation_graph.manifest.network_system_id = "system-validation".into();
+        let mut test_graph = train_graph.clone();
+        test_graph.manifest.snapshot_id = "snapshot-test".into();
+        test_graph.manifest.network_system_id = "system-test".into();
+
+        let mut train_network = network.clone();
+        train_network.snapshot_id = "snapshot-train".into();
+        fs::create_dir_all(directory.path().join("graphs/validation")).unwrap();
+        fs::create_dir_all(directory.path().join("graphs/test")).unwrap();
+        train_graph
+            .save(&directory.path().join("graphs/train"), &train_network)
+            .unwrap();
+        save_jsonl(
+            &directory.path().join("labels/train.jsonl"),
+            &labels("snapshot-train", train_network.lines.len()),
+        )
+        .unwrap();
+        fs::create_dir_all(directory.path().join("labels")).unwrap();
+        fs::write(
+            directory.path().join("labels/validation.jsonl"),
+            b"this is deliberately not JSON\n",
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("labels/test.jsonl"),
+            b"this is deliberately not JSON\n",
+        )
+        .unwrap();
+
+        let train_labels = labels("snapshot-train", train_graph.manifest.line_count);
+        let validation_labels = labels("snapshot-validation", validation_graph.manifest.line_count);
+        let test_labels = labels("snapshot-test", test_graph.manifest.line_count);
+        let parts = vec![
+            DatasetPart {
+                graph: &train_graph,
+                labels: &train_labels,
+                graph_directory: "graphs/train".into(),
+                label_file: "labels/train.jsonl".into(),
+                split: "train".into(),
+            },
+            DatasetPart {
+                graph: &validation_graph,
+                labels: &validation_labels,
+                graph_directory: "graphs/validation".into(),
+                label_file: "labels/validation.jsonl".into(),
+                split: "validation".into(),
+            },
+            DatasetPart {
+                graph: &test_graph,
+                labels: &test_labels,
+                graph_directory: "graphs/test".into(),
+                label_file: "labels/test.jsonl".into(),
+                split: "test".into(),
+            },
+        ];
+        let manifest = create_dataset_manifest(
+            &parts,
+            serde_json::json!({
+                "strategy": "system-level",
+                "train": ["snapshot-train"],
+                "validation": ["snapshot-validation"],
+                "test": ["snapshot-test"]
+            }),
+            None,
+            0,
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+        save_dataset_manifest(&directory.path().join("dataset-manifest.json"), &manifest).unwrap();
+
+        let loaded = load_dataset_split(directory.path(), DatasetSplit::Train).unwrap();
+        assert_eq!(loaded.entries.len(), 1);
+        assert_eq!(
+            loaded.entries[0].graph.manifest.snapshot_id,
+            "snapshot-train"
+        );
     }
 }

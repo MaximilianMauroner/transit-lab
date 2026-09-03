@@ -1649,22 +1649,26 @@ mod tests {
             ..metadata()
         };
         let control = TrainingControl::new(None, None);
-        let (continuous, ReferenceTrainingOutcome::Completed { .. }) =
-            run_reference_pretraining_multi_with_policy_options(
-                &graphs,
-                &full_config,
-                continuous_root.path(),
-                None,
-                &control,
-                CheckpointPolicy {
-                    every_steps: Some(8),
-                    every_seconds: None,
-                },
-                &metadata,
-                false,
-                &mut NoopTrainingObserver,
-            )
-            .unwrap()
+        let (
+            continuous,
+            ReferenceTrainingOutcome::Completed {
+                checkpoint_path: continuous_checkpoint_path,
+            },
+        ) = run_reference_pretraining_multi_with_policy_options(
+            &graphs,
+            &full_config,
+            continuous_root.path(),
+            None,
+            &control,
+            CheckpointPolicy {
+                every_steps: Some(8),
+                every_seconds: None,
+            },
+            &metadata,
+            false,
+            &mut NoopTrainingObserver,
+        )
+        .unwrap()
         else {
             panic!("multi-city continuous run did not complete")
         };
@@ -1713,6 +1717,11 @@ mod tests {
                 first_graph.manifest.snapshot_id.clone(),
                 "snapshot-second-city".into()
             ]
+        );
+        let (persisted, _) = crate::load_training_checkpoint(&continuous_checkpoint_path).unwrap();
+        assert_eq!(
+            persisted.sampler.graph_order,
+            continuous.sampler.graph_order
         );
         assert_eq!(
             continuous.sampler.current_graph,

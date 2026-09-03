@@ -13,8 +13,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use transit_dataset::{
-    create_dataset_manifest, load_dataset_collection, save_dataset_manifest, DatasetExample,
-    DatasetPart,
+    create_dataset_manifest, load_dataset_collection, load_dataset_split, save_dataset_manifest,
+    DatasetExample, DatasetPart, DatasetSplit,
 };
 use transit_domain::{hex_digest, parse_departure_time, sha256_bytes, ValidationReport};
 use transit_graph::GraphTensor;
@@ -333,14 +333,25 @@ struct CriticalityArgs {
 
 #[derive(Debug, Args)]
 struct MultiTaskArgs {
-    /// Repeat once per compiled graph. All graphs must use the same graph
-    /// feature schema; the encoder is shared across them.
-    #[arg(long = "graph", required = true)]
+    /// A versioned dataset directory. Only the selected split is loaded.
+    #[arg(long)]
+    dataset: Option<PathBuf>,
+    /// Dataset partition to use for this training session.
+    #[arg(long, default_value = "train")]
+    split: String,
+    /// Repeat once per compiled graph for low-level development runs. This
+    /// bypasses dataset split validation and therefore requires the explicit
+    /// --allow-unpartitioned-input acknowledgement.
+    #[arg(long = "graph")]
     graphs: Vec<PathBuf>,
     /// Optional labels in the same order as --graph. Missing entries are
     /// treated as unsupervised snapshots.
     #[arg(long = "labels")]
     labels: Vec<PathBuf>,
+    /// Explicitly acknowledge that repeated --graph inputs are not partitioned
+    /// by a dataset manifest. Intended for local development only.
+    #[arg(long)]
+    allow_unpartitioned_input: bool,
     #[arg(long)]
     config: Option<PathBuf>,
     #[arg(long)]
@@ -1119,19 +1130,25 @@ fn dataset_split(
             network
         );
     }
-    if args.test_snapshots.iter().any(|value| value == snapshot)
-        || args.test_networks.iter().any(|value| value == network)
-    {
-        Ok("test".into())
-    } else if args
+    let matches_test = args.test_snapshots.iter().any(|value| value == snapshot)
+        || args.test_networks.iter().any(|value| value == network);
+    let matches_validation = args
         .validation_snapshots
         .iter()
         .any(|value| value == snapshot)
         || args
             .validation_networks
             .iter()
-            .any(|value| value == network)
-    {
+            .any(|value| value == network);
+    if matches_test && matches_validation {
+        bail!(
+            "graph {} matches both validation and test dataset partitions",
+            graph.manifest.snapshot_id
+        );
+    }
+    if matches_test {
+        Ok("test".into())
+    } else if matches_validation {
         Ok("validation".into())
     } else {
         Ok("train".into())
@@ -1231,8 +1248,6 @@ fn command_build_dataset(args: BuildDatasetArgs) -> Result<()> {
             );
         }
     }
-    fs::create_dir_all(&args.output)?;
-
     let graphs = args
         .graphs
         .iter()
@@ -1318,9 +1333,6 @@ fn command_build_dataset(args: BuildDatasetArgs) -> Result<()> {
     {
         let graph_relative = format!("graphs/{index:04}");
         let label_relative = format!("labels/{index:04}.jsonl");
-        copy_directory(&args.graphs[index], &args.output.join(&graph_relative))?;
-        let label_path = args.output.join(&label_relative);
-        save_jsonl(&label_path, rows)?;
         for label in rows {
             examples.push(DatasetExample {
                 snapshot_id: graph.manifest.snapshot_id.clone(),
@@ -1347,8 +1359,6 @@ fn command_build_dataset(args: BuildDatasetArgs) -> Result<()> {
             split: split_name.clone(),
         });
     }
-    let examples_path = args.output.join("examples.json");
-    write_json_file(&examples_path, &serde_json::to_value(&examples)?)?;
     let manifest = create_dataset_manifest(
         &parts,
         split,
@@ -1357,6 +1367,16 @@ fn command_build_dataset(args: BuildDatasetArgs) -> Result<()> {
         input_artifacts,
         std::env::var("TRANSIT_RUN_ID").ok(),
     )?;
+
+    fs::create_dir_all(&args.output)?;
+    for (index, rows) in labels.iter().enumerate() {
+        let graph_relative = format!("graphs/{index:04}");
+        let label_relative = format!("labels/{index:04}.jsonl");
+        copy_directory(&args.graphs[index], &args.output.join(&graph_relative))?;
+        save_jsonl(&args.output.join(&label_relative), rows)?;
+    }
+    let examples_path = args.output.join("examples.json");
+    write_json_file(&examples_path, &serde_json::to_value(&examples)?)?;
     save_dataset_manifest(&args.output.join("dataset-manifest.json"), &manifest)?;
     write_artifact_manifest(&args.output, "dataset-manifest")?;
     emit_runtime_event(
@@ -2191,8 +2211,11 @@ fn command_pretrain_libtorch(args: PretrainArgs, config: PretrainingConfig) -> R
     };
     command_libtorch_multitask(
         MultiTaskArgs {
+            dataset: None,
+            split: "train".into(),
             graphs: vec![args.graph],
             labels: Vec::new(),
+            allow_unpartitioned_input: true,
             config: args.config,
             output: args.output,
             seed: args.seed,
@@ -2345,22 +2368,51 @@ fn set_multitask_seed(config: &mut MultiTaskTrainingConfig, seed: u64) {
     config.criticality.seed = seed;
 }
 
-fn command_multitask(args: MultiTaskArgs) -> Result<()> {
+fn load_multitask_datasets(
+    args: &MultiTaskArgs,
+) -> Result<(Vec<GraphTensor>, Vec<Vec<transit_labels::LineImpactLabel>>)> {
+    if let Some(dataset) = args.dataset.as_deref() {
+        if !args.graphs.is_empty() {
+            bail!("--dataset cannot be combined with --graph");
+        }
+        if !args.labels.is_empty() {
+            bail!("--dataset cannot be combined with --labels");
+        }
+        if args.allow_unpartitioned_input {
+            bail!("--allow-unpartitioned-input is only valid with --graph");
+        }
+        let split = DatasetSplit::parse(&args.split)?;
+        let collection = load_dataset_split(dataset, split).with_context(|| {
+            format!(
+                "loading {} split from dataset {}",
+                split.as_str(),
+                dataset.display()
+            )
+        })?;
+        let mut graphs = Vec::with_capacity(collection.entries.len());
+        let mut labels = Vec::with_capacity(collection.entries.len());
+        for entry in collection.entries {
+            graphs.push(entry.graph);
+            labels.push(entry.labels);
+        }
+        return Ok((graphs, labels));
+    }
+
+    if args.graphs.is_empty() {
+        bail!("provide --dataset or at least one --graph");
+    }
+    if !args.allow_unpartitioned_input {
+        bail!(
+            "repeated --graph training inputs are unpartitioned; provide --dataset or pass --allow-unpartitioned-input for local development"
+        );
+    }
+    if DatasetSplit::parse(&args.split)? != DatasetSplit::Train {
+        bail!("--split is only available with --dataset");
+    }
     if args.labels.len() > args.graphs.len() {
         bail!("provide at most one --labels file for each --graph");
     }
-    let (mut config, config_fingerprint, declared_seed) =
-        load_multitask_config(args.config.as_deref())?;
-    if let (Some(declared), Some(requested)) = (declared_seed, args.seed) {
-        if declared != requested {
-            bail!("--seed {requested} does not match the resolved config seed {declared}");
-        }
-    }
-    if let Some(seed) = args.seed {
-        set_multitask_seed(&mut config, seed);
-    }
-    apply_multitask_runtime(&mut config, &args.resumable)?;
-    let graphs: Vec<GraphTensor> = args
+    let graphs = args
         .graphs
         .iter()
         .map(|path| {
@@ -2375,6 +2427,22 @@ fn command_multitask(args: MultiTaskArgs) -> Result<()> {
             Vec::new()
         });
     }
+    Ok((graphs, labels))
+}
+
+fn command_multitask(args: MultiTaskArgs) -> Result<()> {
+    let (mut config, config_fingerprint, declared_seed) =
+        load_multitask_config(args.config.as_deref())?;
+    if let (Some(declared), Some(requested)) = (declared_seed, args.seed) {
+        if declared != requested {
+            bail!("--seed {requested} does not match the resolved config seed {declared}");
+        }
+    }
+    if let Some(seed) = args.seed {
+        set_multitask_seed(&mut config, seed);
+    }
+    apply_multitask_runtime(&mut config, &args.resumable)?;
+    let (graphs, labels) = load_multitask_datasets(&args)?;
     let datasets: Vec<(&GraphTensor, &[transit_labels::LineImpactLabel])> = graphs
         .iter()
         .zip(&labels)
@@ -3767,4 +3835,189 @@ fn format_gtfs_time(seconds: u32) -> String {
         (seconds / 60) % 60,
         seconds % 60
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::NaiveDate;
+    use gtfs_compile::{compile, CompileOptions};
+    use gtfs_ingest::GtfsFeed;
+    use std::fs;
+    use tempfile::tempdir;
+    use transit_training::NoopTrainingObserver;
+
+    fn fixture() -> (transit_domain::CompiledNetwork, GraphTensor) {
+        let feed = GtfsFeed::from_path(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/synthetic-feeds/basic"
+        ))
+        .expect("synthetic fixture loads");
+        let network = compile(
+            &feed,
+            &CompileOptions::for_date(NaiveDate::from_ymd_opt(2026, 9, 7).unwrap())
+                .with_scope("synthetic fixture")
+                .with_source_name("fixture"),
+        )
+        .expect("synthetic fixture compiles");
+        let graph = GraphTensor::from_network(&network).expect("synthetic graph builds");
+        (network, graph)
+    }
+
+    fn graph_variant(graph: &GraphTensor, snapshot: &str, system: &str) -> GraphTensor {
+        let mut variant = graph.clone();
+        variant.manifest.snapshot_id = snapshot.into();
+        variant.manifest.network_system_id = system.into();
+        variant
+    }
+
+    fn empty_parts<'a>(
+        train: &'a GraphTensor,
+        validation: &'a GraphTensor,
+        test: &'a GraphTensor,
+    ) -> Vec<DatasetPart<'a>> {
+        vec![
+            DatasetPart {
+                graph: train,
+                labels: &[],
+                graph_directory: "graphs/train".into(),
+                label_file: "labels/train.jsonl".into(),
+                split: "train".into(),
+            },
+            DatasetPart {
+                graph: validation,
+                labels: &[],
+                graph_directory: "graphs/validation".into(),
+                label_file: "labels/validation.jsonl".into(),
+                split: "validation".into(),
+            },
+            DatasetPart {
+                graph: test,
+                labels: &[],
+                graph_directory: "graphs/test".into(),
+                label_file: "labels/test.jsonl".into(),
+                split: "test".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn dataset_training_checkpoint_contains_only_the_train_graph_order() {
+        let (network, graph) = fixture();
+        let directory = tempdir().unwrap();
+        let train = graph_variant(&graph, "snapshot-train", "system-train");
+        let validation = graph_variant(&graph, "snapshot-validation", "system-validation");
+        let test = graph_variant(&graph, "snapshot-test", "system-test");
+
+        let mut train_network = network;
+        train_network.snapshot_id = "snapshot-train".into();
+        train
+            .save(&directory.path().join("graphs/train"), &train_network)
+            .unwrap();
+        fs::create_dir_all(directory.path().join("graphs/validation")).unwrap();
+        fs::create_dir_all(directory.path().join("graphs/test")).unwrap();
+        fs::create_dir_all(directory.path().join("labels")).unwrap();
+        fs::write(directory.path().join("labels/train.jsonl"), b"").unwrap();
+        fs::write(
+            directory.path().join("labels/validation.jsonl"),
+            b"not a label file\n",
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("labels/test.jsonl"),
+            b"not a label file\n",
+        )
+        .unwrap();
+
+        let manifest = create_dataset_manifest(
+            &empty_parts(&train, &validation, &test),
+            json!({
+                "strategy": "system-level",
+                "train": ["snapshot-train"],
+                "validation": ["snapshot-validation"],
+                "test": ["snapshot-test"]
+            }),
+            None,
+            0,
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+        save_dataset_manifest(&directory.path().join("dataset-manifest.json"), &manifest).unwrap();
+
+        let args = MultiTaskArgs {
+            dataset: Some(directory.path().to_path_buf()),
+            split: "train".into(),
+            graphs: Vec::new(),
+            labels: Vec::new(),
+            allow_unpartitioned_input: false,
+            config: None,
+            output: directory.path().join("model.json"),
+            seed: None,
+            resumable: ResumableArgs {
+                checkpoint_dir: None,
+                resume: None,
+                control_file: None,
+                checkpoint_every_steps: None,
+                checkpoint_every_seconds: None,
+                max_wall_time_seconds: None,
+                checkpoint_grace_seconds: None,
+                run_id: None,
+                backend: None,
+                fork_from_checkpoint: false,
+                device: None,
+                dtype: None,
+                cpu_threads: None,
+                rayon_threads: None,
+                gradient_accumulation: None,
+            },
+        };
+        let (graphs, labels) = load_multitask_datasets(&args).unwrap();
+        assert_eq!(
+            graphs
+                .iter()
+                .map(|graph| graph.manifest.snapshot_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["snapshot-train"]
+        );
+        assert!(labels.iter().all(Vec::is_empty));
+
+        let graph_refs = graphs.iter().collect::<Vec<_>>();
+        let control = TrainingControl::new(None, None);
+        let mut config = MultiTaskTrainingConfig::default();
+        config.pretraining.model.hidden_dimension = 8;
+        config.pretraining.model.graph_layers = 1;
+        config.pretraining.steps = 1;
+        config.metric_epochs = 0;
+        config.criticality.epochs = 0;
+        let metadata = CheckpointMetadata {
+            run_id: "run-dataset-boundary".into(),
+            dataset_fingerprint: manifest.fingerprint,
+            config_fingerprint: "config-dataset-boundary".into(),
+            ..CheckpointMetadata::default()
+        };
+        let (_, outcome) = transit_training::run_reference_pretraining_multi_with_policy_options(
+            &graph_refs,
+            &config.pretraining,
+            &directory.path().join("checkpoints"),
+            None,
+            &control,
+            CheckpointPolicy {
+                every_steps: Some(1),
+                every_seconds: None,
+            },
+            &metadata,
+            false,
+            &mut NoopTrainingObserver,
+        )
+        .unwrap();
+        let ReferenceTrainingOutcome::Completed { checkpoint_path } = outcome else {
+            panic!("training fixture did not complete");
+        };
+        let (checkpoint, _) = load_training_checkpoint(&checkpoint_path).unwrap();
+        assert_eq!(
+            checkpoint.sampler.graph_order,
+            vec!["snapshot-train".to_owned()]
+        );
+    }
 }

@@ -1999,6 +1999,7 @@ dependencies = [
  "gtfs-source",
  "serde",
  "serde_json",
+ "tempfile",
  "transit-dataset",
  "transit-domain",
  "transit-graph",

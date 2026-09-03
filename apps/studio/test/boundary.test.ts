@@ -147,6 +147,25 @@ test("dataset and evaluation runs use indexed immutable inputs", async () => {
     "transit", "evaluate", "--dataset", "data/dataset-1", "--model", "data/dataset-1/model.json", "--model-id", "model-1",
     "--output", "data/runs/run-1/evaluation.json", "--split", "test", "--top-k", "5", "--seed", "19"
   ]);
+
+  await mkdir(join(root, "data/runs/run-1"), { recursive: true });
+  await writeFile(join(root, "data/runs/run-1/resolved-config.json"), "{}\n");
+  const trainingCommand = buildRustCommand({
+    db,
+    root,
+    runId: "run-1",
+    spec: { kind: "train", datasetId: "dataset-1", seed: 7, runtime: {} },
+    binary: "transit"
+  });
+  expect(trainingCommand.argv).toEqual([
+    "transit", "train", "multitask", "--dataset", "data/dataset-1", "--split", "train",
+    "--config", "data/runs/run-1/resolved-config.json", "--seed", "7",
+    "--output", "data/runs/run-1/model.json", "--checkpoint-dir", "data/runs/run-1/checkpoints",
+    "--control-file", "data/runs/run-1/control.json", "--run-id", "run-1",
+    "--checkpoint-every-steps", "500", "--checkpoint-every-seconds", "900"
+  ]);
+  expect(trainingCommand.argv).not.toContain("--graph");
+  expect(trainingCommand.argv).not.toContain("--labels");
   db.close();
 });
 

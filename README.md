@@ -220,11 +220,16 @@ The reference training command is:
 
 ```bash
 cargo run -p transit-cli -- train multitask \
-  --graph data/graphs/vienna \
-  --labels data/labels/vienna.jsonl \
+  --dataset data/datasets/europe-v1 \
+  --split train \
   --config configs/models/multitask-v1.yaml \
-  --output data/models/vienna.json
+  --output data/models/europe-v1.json
 ```
+
+Dataset-backed training loads only the selected manifest partition. Repeated
+`--graph` inputs are reserved for low-level development and require
+`--allow-unpartitioned-input`; they do not provide a valid held-out evaluation
+boundary.
 
 Training attempts can checkpoint and exit cooperatively. The logical run keeps
 its identity while later worker attempts resume the newest committed
@@ -232,10 +237,10 @@ checkpoint:
 
 ```bash
 cargo run -p transit-cli -- train multitask \
-  --graph data/graphs/vienna \
-  --labels data/labels/vienna.jsonl \
+  --dataset data/datasets/europe-v1 \
+  --split train \
   --config configs/models/multitask-v1.yaml \
-  --output data/models/vienna.json \
+  --output data/models/europe-v1.json \
   --checkpoint-dir data/runs/vienna-training/checkpoints \
   --control-file data/runs/vienna-training/control.json \
   --checkpoint-every-steps 500 \

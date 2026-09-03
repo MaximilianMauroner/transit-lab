@@ -28,3 +28,6 @@ transit-model = { path = "../transit-model" }
 transit-router = { path = "../transit-router" }
 transit-search = { path = "../transit-search" }
 transit-training = { path = "../transit-training" }
+
+[dev-dependencies]
+tempfile.workspace = true

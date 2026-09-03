@@ -131,33 +131,9 @@ function requireDataset(db, root, datasetId) {
     throw new Error(`could not read dataset ${datasetId} manifest: ${error instanceof Error ? error.message : String(error)}`);
   }
   const directory = dirname(manifestPath);
-  const entries = Array.isArray(manifest.entries) && manifest.entries.length
-    ? manifest.entries
-    : [{
-      graph_directory: manifest.graph_directory || manifest.graphDirectory || "graph",
-      label_file: manifest.label_file || manifest.labelFile || "labels.jsonl"
-    }];
-  const graphs = entries.map((entry, index) => {
-    const graph = resolve(directory, entry.graph_directory || entry.graphDirectory || "graph");
-    if (!inside(directory, graph)) throw new Error(`dataset entry ${index} graph path escaped its dataset`);
-    return graph;
-  });
-  const labels = entries.map((entry, index) => {
-    const raw = entry.label_file || entry.labelFile;
-    if (!raw) return null;
-    const label = resolve(directory, raw);
-    if (!inside(directory, label)) throw new Error(`dataset entry ${index} label path escaped its dataset`);
-    return label;
-  });
-  const hasAllLabels = labels.length > 0 && labels.every(Boolean);
   return {
     dataset: commandPath(root, directory),
-    datasetFingerprint: manifest.fingerprint || dataset.fingerprint,
-    graphs: graphs.map((graph) => commandPath(root, graph)),
-    // The Rust CLI accepts repeated positional pairs by order. If one entry
-    // has no labels, pass no labels at all and let that dataset be treated as
-    // unsupervised instead of silently shifting labels onto another graph.
-    labels: hasAllLabels ? labels.map((label) => commandPath(root, label)) : []
+    datasetFingerprint: manifest.fingerprint || dataset.fingerprint
   };
 }
 
@@ -351,8 +327,8 @@ export function buildRustCommand({
       return {
         argv: rustArgv(root, binary, [
           "train", "multitask",
-          ...dataset.graphs.flatMap((graph) => ["--graph", graph]),
-          ...dataset.labels.flatMap((labels) => ["--labels", labels]),
+          "--dataset", dataset.dataset,
+          "--split", "train",
           "--config", commandPath(root, config),
           "--seed", String(spec.seed),
           "--output", commandPath(root, output),
