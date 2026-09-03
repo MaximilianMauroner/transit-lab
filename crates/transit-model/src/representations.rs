@@ -21,7 +21,7 @@ pub const SERVICE_EMBEDDING_DIM: usize = 32;
 pub const GEOMETRY_EMBEDDING_DIM: usize = 32;
 pub const RESILIENCE_EMBEDDING_DIM: usize = 32;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct RepresentationConfig {
     pub base_dimension: usize,
     pub city_dimension: usize,

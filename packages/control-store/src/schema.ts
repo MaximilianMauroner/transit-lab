@@ -5,7 +5,7 @@ import type { Database } from "bun:sqlite";
  * schema is declarative and every statement is safe to run against an empty
  * or already-populated local database.
  */
-export const CONTROL_STORE_SCHEMA_VERSION = 1;
+export const CONTROL_STORE_SCHEMA_VERSION = 5;
 
 export const CONTROL_STORE_SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS projects (
@@ -119,6 +119,8 @@ CREATE TABLE IF NOT EXISTS runs (
   project_id TEXT NOT NULL REFERENCES projects(id),
   kind TEXT NOT NULL,
   status TEXT NOT NULL,
+  desired_state TEXT NOT NULL DEFAULT 'running',
+  observed_state TEXT NOT NULL DEFAULT 'queued',
   spec_json TEXT NOT NULL,
   fingerprint TEXT NOT NULL,
   config_fingerprint TEXT NOT NULL DEFAULT '',
@@ -133,6 +135,20 @@ CREATE TABLE IF NOT EXISTS runs (
   worker_id TEXT,
   git_commit TEXT NOT NULL DEFAULT '',
   cancel_requested INTEGER NOT NULL DEFAULT 0,
+  latest_checkpoint_id TEXT,
+  current_attempt_id TEXT,
+  parent_run_id TEXT REFERENCES runs(id),
+  resume_checkpoint_id TEXT,
+  checkpoint_root TEXT NOT NULL DEFAULT '',
+  control_file_path TEXT NOT NULL DEFAULT '',
+  phase TEXT NOT NULL DEFAULT '',
+  global_step INTEGER NOT NULL DEFAULT 0,
+  resume_not_before TEXT,
+  total_compute_seconds REAL NOT NULL DEFAULT 0,
+  paused_seconds REAL NOT NULL DEFAULT 0,
+  paused_since TEXT,
+  schedule_json TEXT NOT NULL DEFAULT '{}',
+  last_heartbeat_at TEXT,
   error_code TEXT,
   error_message TEXT,
   started_at TEXT,
@@ -152,6 +168,40 @@ CREATE TABLE IF NOT EXISTS run_steps (
   output_fingerprint TEXT,
   metrics_json TEXT NOT NULL DEFAULT '{}',
   UNIQUE(run_id, step)
+);
+
+CREATE TABLE IF NOT EXISTS run_attempts (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES runs(id),
+  ordinal INTEGER NOT NULL,
+  worker_id TEXT,
+  resume_checkpoint_id TEXT,
+  status TEXT NOT NULL,
+  exit_reason TEXT,
+  hostname TEXT NOT NULL DEFAULT '',
+  device_json TEXT NOT NULL DEFAULT '{}',
+  started_at TEXT NOT NULL,
+  finished_at TEXT,
+  last_heartbeat_at TEXT,
+  compute_seconds REAL NOT NULL DEFAULT 0,
+  UNIQUE(run_id, ordinal)
+);
+
+CREATE TABLE IF NOT EXISTS training_checkpoints (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES runs(id),
+  attempt_id TEXT REFERENCES run_attempts(id),
+  phase TEXT NOT NULL,
+  global_step INTEGER NOT NULL,
+  local_path TEXT NOT NULL,
+  sha256 TEXT NOT NULL,
+  config_fingerprint TEXT NOT NULL,
+  dataset_fingerprint TEXT NOT NULL,
+  git_commit TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL,
+  metrics_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL,
+  UNIQUE(run_id, global_step)
 );
 
 CREATE TABLE IF NOT EXISTS run_events (
@@ -251,11 +301,49 @@ CREATE TABLE IF NOT EXISTS metric_points (
   run_id TEXT REFERENCES runs(id),
   model_id TEXT REFERENCES model_versions(id),
   dataset_id TEXT REFERENCES datasets(id),
+  evaluation_id TEXT,
   name TEXT NOT NULL,
   value REAL NOT NULL,
   split TEXT,
   network_id TEXT REFERENCES networks(id),
   dimensions_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS evaluation_results (
+  id TEXT PRIMARY KEY,
+  fingerprint TEXT NOT NULL UNIQUE,
+  artifact_id TEXT NOT NULL REFERENCES artifacts(id),
+  dataset_id TEXT NOT NULL REFERENCES datasets(id),
+  model_id TEXT REFERENCES model_versions(id),
+  split TEXT NOT NULL,
+  top_k INTEGER NOT NULL,
+  report_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS benchmarks (
+  id TEXT PRIMARY KEY,
+  fingerprint TEXT NOT NULL UNIQUE,
+  artifact_id TEXT NOT NULL REFERENCES artifacts(id),
+  run_id TEXT REFERENCES runs(id),
+  benchmark TEXT NOT NULL,
+  workload TEXT NOT NULL,
+  snapshot_id TEXT,
+  graph_id TEXT,
+  thread_count INTEGER,
+  warmup_units INTEGER NOT NULL DEFAULT 0,
+  measured_units INTEGER NOT NULL DEFAULT 0,
+  estimated_work_units INTEGER,
+  median_milliseconds REAL,
+  p95_milliseconds REAL,
+  throughput REAL NOT NULL,
+  throughput_unit TEXT NOT NULL,
+  peak_resident_memory_bytes INTEGER,
+  graph_counts_json TEXT NOT NULL DEFAULT '{}',
+  runtime_json TEXT NOT NULL DEFAULT '{}',
+  thread_configuration_json TEXT NOT NULL DEFAULT '{}',
+  report_json TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
 
@@ -345,7 +433,31 @@ const COMPATIBILITY_COLUMNS: ColumnDefinition[] = [
   { table: "runs", name: "created_at", definition: "TEXT NOT NULL DEFAULT ''" },
   { table: "runs", name: "updated_at", definition: "TEXT NOT NULL DEFAULT ''" },
   { table: "runs", name: "config_fingerprint", definition: "TEXT NOT NULL DEFAULT ''" },
-  { table: "runs", name: "resolved_config_path", definition: "TEXT NOT NULL DEFAULT ''" }
+  { table: "runs", name: "resolved_config_path", definition: "TEXT NOT NULL DEFAULT ''" },
+  { table: "runs", name: "desired_state", definition: "TEXT NOT NULL DEFAULT 'running'" },
+  { table: "runs", name: "observed_state", definition: "TEXT NOT NULL DEFAULT 'queued'" },
+  { table: "runs", name: "latest_checkpoint_id", definition: "TEXT" },
+  { table: "runs", name: "current_attempt_id", definition: "TEXT" },
+  { table: "runs", name: "parent_run_id", definition: "TEXT" },
+  { table: "runs", name: "resume_checkpoint_id", definition: "TEXT" },
+  { table: "runs", name: "checkpoint_root", definition: "TEXT NOT NULL DEFAULT ''" },
+  { table: "runs", name: "control_file_path", definition: "TEXT NOT NULL DEFAULT ''" },
+  { table: "runs", name: "phase", definition: "TEXT NOT NULL DEFAULT ''" },
+  { table: "runs", name: "global_step", definition: "INTEGER NOT NULL DEFAULT 0" },
+  { table: "runs", name: "resume_not_before", definition: "TEXT" },
+  { table: "runs", name: "total_compute_seconds", definition: "REAL NOT NULL DEFAULT 0" },
+  { table: "runs", name: "paused_seconds", definition: "REAL NOT NULL DEFAULT 0" },
+  { table: "runs", name: "paused_since", definition: "TEXT" },
+  { table: "runs", name: "schedule_json", definition: "TEXT NOT NULL DEFAULT '{}'" },
+  { table: "runs", name: "last_heartbeat_at", definition: "TEXT" },
+  { table: "run_attempts", name: "compute_seconds", definition: "REAL NOT NULL DEFAULT 0" },
+  { table: "model_versions", name: "dataset_id", definition: "TEXT REFERENCES datasets(id)" },
+  { table: "model_versions", name: "training_run_id", definition: "TEXT REFERENCES runs(id)" },
+  { table: "model_versions", name: "checkpoint_artifact_id", definition: "TEXT REFERENCES artifacts(id)" },
+  { table: "model_versions", name: "embedding_dimensions_json", definition: "TEXT NOT NULL DEFAULT '{}'" },
+  { table: "model_versions", name: "supported_heads_json", definition: "TEXT NOT NULL DEFAULT '[]'" },
+  { table: "model_versions", name: "evaluation_json", definition: "TEXT NOT NULL DEFAULT '{}'" },
+  { table: "metric_points", name: "evaluation_id", definition: "TEXT" }
 ];
 
 function tableColumns(db: Database, table: string) {
@@ -361,7 +473,21 @@ export function pushDatabaseSchema(db: Database) {
       db.exec(`ALTER TABLE ${column.table} ADD COLUMN ${column.name} ${column.definition}`);
     }
   }
+  // Existing databases used `status` as the only lifecycle field. Backfill
+  // the new observed state once, without rewriting an explicitly populated
+  // value from a newer schema.
+  db.exec(`UPDATE runs SET observed_state = status
+    WHERE observed_state = 'queued' AND status <> 'queued'`);
+  db.exec(`UPDATE runs SET desired_state = CASE WHEN cancel_requested = 1 THEN 'cancelled' ELSE 'running' END
+    WHERE desired_state = 'running' OR desired_state IS NULL`);
   db.exec("CREATE INDEX IF NOT EXISTS runs_status_idx ON runs(status, created_at);");
   db.exec("CREATE INDEX IF NOT EXISTS runs_fingerprint_idx ON runs(fingerprint);");
+  db.exec("CREATE INDEX IF NOT EXISTS runs_observed_state_idx ON runs(observed_state, created_at);");
+  db.exec("CREATE INDEX IF NOT EXISTS run_attempts_run_idx ON run_attempts(run_id, ordinal);");
+  db.exec("CREATE INDEX IF NOT EXISTS training_checkpoints_run_step_idx ON training_checkpoints(run_id, global_step);");
+  db.exec("CREATE INDEX IF NOT EXISTS metric_points_evaluation_idx ON metric_points(evaluation_id, created_at);");
+  db.exec("CREATE INDEX IF NOT EXISTS evaluation_results_dataset_model_idx ON evaluation_results(dataset_id, model_id, created_at);");
+  db.exec("CREATE INDEX IF NOT EXISTS benchmarks_workload_snapshot_idx ON benchmarks(workload, snapshot_id, created_at);");
+  db.exec("CREATE INDEX IF NOT EXISTS benchmarks_graph_workload_idx ON benchmarks(graph_id, workload, created_at);");
   return { version: CONTROL_STORE_SCHEMA_VERSION };
 }

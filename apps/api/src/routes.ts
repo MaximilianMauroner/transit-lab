@@ -9,15 +9,21 @@ import {
   all,
   appendRunEventType,
   createRun,
+  forkRun,
   getRun,
   getRunEvents,
   getRunLogs,
+  listRunAttempts,
+  listBenchmarks,
+  listTrainingCheckpoints,
   json,
   listRuns,
   now,
   one,
   parseJson,
   requestRunCancellation,
+  requestRunPause,
+  requestRunResume,
   run
 } from "../../../packages/control-store/src/database.ts";
 import {
@@ -29,6 +35,7 @@ import {
   syncFilesystem
 } from "../../../packages/control-store/src/inventory.ts";
 import { loadSimilarityResult } from "../../../packages/control-store/src/similarity.ts";
+import { scheduleDescription } from "../../../packages/control-store/src/schedule.ts";
 
 const DEFAULT_METRIC_NAMES = [
   "accessibility_auc_loss",
@@ -59,9 +66,69 @@ function fail(status, message) {
   return sendJson({ error: message }, status);
 }
 
+async function requestObject(request, field) {
+  const source = await request.text();
+  if (!source.trim()) return {};
+  let body;
+  try {
+    body = JSON.parse(source);
+  } catch {
+    throw new ApiError(400, `${field} body must be valid JSON`);
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    throw new ApiError(400, `${field} body must be an object`);
+  }
+  return body;
+}
+
 function numeric(value, fallback = 0) {
   const result = Number(value);
   return Number.isFinite(result) ? result : fallback;
+}
+
+function benchmarkForRun(db, run) {
+  const candidates = listBenchmarks(db, { limit: 2_000 });
+  if (run.kind === "train") {
+    const dataset = run.datasetId
+      ? one(db, "SELECT snapshot_ids_json FROM datasets WHERE id = ?", [run.datasetId])
+      : null;
+    const snapshots = new Set(parseJson(dataset?.snapshot_ids_json, []));
+    return candidates.find((benchmark) => benchmark.workload === "train-step" &&
+      (!snapshots.size || snapshots.has(benchmark.graphId) || snapshots.has(benchmark.snapshotId))) || null;
+  }
+  if (run.kind === "simulate-criticality" && run.snapshotId) {
+    return candidates.find((benchmark) => benchmark.workload === "routing" &&
+      (!benchmark.snapshotId || benchmark.snapshotId === run.snapshotId)) || null;
+  }
+  return null;
+}
+
+function runEstimate(db, run) {
+  const active = ["starting", "claimed", "running", "checkpointing"].includes(run.observedState || run.status);
+  const activeAttempt = (run.attempts || []).find((attempt) =>
+    attempt.id === run.currentAttemptId && ["starting", "running", "checkpointing"].includes(attempt.status)
+  );
+  const activeSeconds = run.totalComputeSeconds + (active && activeAttempt?.startedAt
+    ? Math.max(0, Date.now() - Date.parse(activeAttempt.startedAt)) / 1_000
+    : 0);
+  const completed = numeric(run.progress?.completed);
+  const total = numeric(run.progress?.total);
+  const liveThroughput = activeSeconds > 0 && completed > 0 ? completed / activeSeconds : 0;
+  const benchmark = benchmarkForRun(db, run);
+  const throughput = liveThroughput > 0 ? liveThroughput : Number(benchmark?.throughput || 0);
+  const remaining = total > completed ? total - completed : 0;
+  return {
+    unit: run.progress?.unit || null,
+    completed,
+    total,
+    throughput,
+    etaSeconds: throughput > 0 && remaining > 0 ? remaining / throughput : null,
+    measuredComputeSeconds: activeSeconds,
+    throughputUnit: liveThroughput > 0 ? (run.progress?.unit || "work_units_per_second") : benchmark?.throughputUnit || null,
+    benchmark: benchmark || null,
+    source: liveThroughput > 0 ? "live-run" : benchmark ? "benchmark" : "unavailable",
+    schedule: scheduleDescription(run.schedule)
+  };
 }
 
 function snapshotRow(row) {
@@ -208,12 +275,13 @@ function getInference(db, inferenceId, snapshotId) {
 }
 
 function listEvaluations(db) {
-  return all(db, `SELECT se.*, mv.version AS model_version, d.id AS dataset_id_value
+  const similarity = all(db, `SELECT se.*, mv.version AS model_version, d.id AS dataset_id_value
     FROM similarity_evaluations se
     LEFT JOIN model_versions mv ON mv.id = se.model_id
     LEFT JOIN datasets d ON d.id = se.dataset_id
     ORDER BY se.created_at DESC, se.id DESC`).map((row) => ({
     id: row.id,
+    kind: "similarity",
     modelId: row.model_id,
     modelVersion: row.model_version,
     datasetId: row.dataset_id_value,
@@ -223,6 +291,31 @@ function listEvaluations(db) {
     split: row.split,
     createdAt: row.created_at
   }));
+  const ranking = all(db, `SELECT mp.id, mp.model_id, mp.dataset_id, mp.name, mp.value,
+      mp.split, mp.created_at, mp.dimensions_json, er.id AS evaluation_id,
+      mv.version AS model_version
+    FROM metric_points mp
+    JOIN evaluation_results er ON er.id = mp.evaluation_id
+    LEFT JOIN model_versions mv ON mv.id = mp.model_id
+    ORDER BY mp.created_at DESC, mp.id DESC`).map((row) => {
+    const dimensions = parseJson(row.dimensions_json, {});
+    return {
+      id: row.id,
+      evaluationId: row.evaluation_id,
+      kind: "ranking",
+      modelId: row.model_id,
+      modelVersion: row.model_version,
+      datasetId: row.dataset_id,
+      facet: dimensions.baseline || "evaluation",
+      metricName: dimensions.metricName || row.name,
+      value: numeric(row.value),
+      split: row.split,
+      createdAt: row.created_at
+    };
+  });
+  return [...similarity, ...ranking].sort((left, right) =>
+    String(right.createdAt).localeCompare(String(left.createdAt)) || Number(right.id) - Number(left.id)
+  );
 }
 
 function listEmbeddings(db) {
@@ -260,7 +353,7 @@ function eventStream(request, db, runId, after) {
           controller.enqueue(encoder.encode(`id: ${event.seq}\ndata: ${JSON.stringify(event)}\n\n`));
         }
         const current = getRun(db, runId);
-        if (current && ["succeeded", "failed", "cancelled", "orphaned"].includes(current.status) &&
+        if (current && ["succeeded", "failed", "cancelled", "paused", "orphaned"].includes(current.status) &&
             getRunEvents(db, runId, cursor, 1).length === 0) close();
       };
       pump();
@@ -361,6 +454,18 @@ export function createApiHandler({ db, root }) {
       if (request.method === "GET" && pathname === "/api/evaluations") {
         return sendJson(listEvaluations(db));
       }
+      if (request.method === "GET" && pathname === "/api/benchmarks") {
+        const workload = url.searchParams.get("workload") || null;
+        if (workload && !["routing", "train-step"].includes(workload)) {
+          throw new ApiError(400, "workload must be routing or train-step");
+        }
+        return sendJson(listBenchmarks(db, {
+          workload,
+          snapshotId: url.searchParams.get("snapshotId") || null,
+          graphId: url.searchParams.get("graphId") || null,
+          limit: numeric(url.searchParams.get("limit"), 500)
+        }));
+      }
       if (request.method === "GET" && pathname === "/api/similarity") {
         const querySnapshotId = url.searchParams.get("querySnapshotId");
         const candidateSnapshotId = url.searchParams.get("candidateSnapshotId");
@@ -406,14 +511,66 @@ export function createApiHandler({ db, root }) {
         if (!current) throw new ApiError(404, "run not found");
         current.logs = getRunLogs(db, current.id);
         current.events = getRunEvents(db, current.id);
+        current.attempts = listRunAttempts(db, current.id);
+        current.checkpoints = listTrainingCheckpoints(db, current.id);
+        current.estimate = runEstimate(db, current);
         return sendJson(current);
+      }
+      const runAttemptsMatch = pathname.match(/^\/api\/runs\/([^/]+)\/attempts$/);
+      if (request.method === "GET" && runAttemptsMatch) {
+        const runId = decodeURIComponent(runAttemptsMatch[1]);
+        if (!getRun(db, runId)) throw new ApiError(404, "run not found");
+        return sendJson(listRunAttempts(db, runId));
+      }
+      const runCheckpointsMatch = pathname.match(/^\/api\/runs\/([^/]+)\/checkpoints$/);
+      if (request.method === "GET" && runCheckpointsMatch) {
+        const runId = decodeURIComponent(runCheckpointsMatch[1]);
+        if (!getRun(db, runId)) throw new ApiError(404, "run not found");
+        return sendJson(listTrainingCheckpoints(db, runId));
       }
       const cancelMatch = pathname.match(/^\/api\/runs\/([^/]+)\/cancel$/);
       if (request.method === "POST" && cancelMatch) {
-        const current = requestRunCancellation(db, decodeURIComponent(cancelMatch[1]));
+        const runId = decodeURIComponent(cancelMatch[1]);
+        const before = getRun(db, runId);
+        const hadRequest = Boolean(before?.cancelRequested || before?.desiredState === "cancelled");
+        const current = requestRunCancellation(db, runId);
         if (!current) throw new ApiError(404, "run not found");
-        if (current.status !== "cancelled") appendRunEventType(db, current.id, "warning", { code: "cancel-requested", message: "Cancellation requested; the worker will stop at its next safe boundary." });
+        if (!hadRequest && current.status !== "cancelled") appendRunEventType(db, current.id, "warning", { code: "cancel-requested", message: "Cancellation requested; the worker will stop at its next safe boundary." });
         return sendJson(getRun(db, current.id));
+      }
+      const pauseMatch = pathname.match(/^\/api\/runs\/([^/]+)\/pause$/);
+      if (request.method === "POST" && pauseMatch) {
+        const current = requestRunPause(db, decodeURIComponent(pauseMatch[1]));
+        if (!current) throw new ApiError(404, "run not found");
+        return sendJson(current);
+      }
+      const resumeMatch = pathname.match(/^\/api\/runs\/([^/]+)\/resume$/);
+      if (request.method === "POST" && resumeMatch) {
+        const body = await requestObject(request, "resume");
+        const resumeNotBefore = body.resumeNotBefore ?? body.resume_not_before ?? null;
+        if (resumeNotBefore !== null && (typeof resumeNotBefore !== "string" || Number.isNaN(Date.parse(resumeNotBefore)))) {
+          throw new ApiError(400, "resumeNotBefore must be an ISO timestamp");
+        }
+        const current = requestRunResume(db, decodeURIComponent(resumeMatch[1]), resumeNotBefore);
+        if (!current) throw new ApiError(404, "run not found");
+        return sendJson(current);
+      }
+      const forkMatch = pathname.match(/^\/api\/runs\/([^/]+)\/fork$/);
+      if (request.method === "POST" && forkMatch) {
+        const body = await requestObject(request, "fork");
+        const checkpointId = body.checkpointId ?? body.checkpoint_id ?? null;
+        if (checkpointId !== null && typeof checkpointId !== "string") {
+          throw new ApiError(400, "checkpointId must be a string");
+        }
+        if (body.spec !== undefined && (!body.spec || typeof body.spec !== "object" || Array.isArray(body.spec))) {
+          throw new ApiError(400, "fork spec must be an object");
+        }
+        const current = forkRun(db, decodeURIComponent(forkMatch[1]), {
+          checkpointId,
+          spec: body.spec || null
+        }, "project-local", root);
+        if (!current) throw new ApiError(404, "run not found");
+        return sendJson(current, 202);
       }
       if (request.method === "GET" && pathname === "/api/views") {
         return sendJson(all(db, "SELECT id, name, spec_json, created_at, updated_at FROM saved_views ORDER BY updated_at DESC").map((row) => ({

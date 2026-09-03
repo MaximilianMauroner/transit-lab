@@ -8,7 +8,8 @@
     "./table": "./src/table.ts"
   },
   "dependencies": {
-    "@transit-lab/api-client": "workspace:*"
+    "@transit-lab/api-client": "workspace:*",
+    "react": "^19.1.1"
   },
   "scripts": {
     "check": "tsc --noEmit"

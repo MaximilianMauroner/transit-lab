@@ -226,6 +226,32 @@ cargo run -p transit-cli -- train multitask \
   --output data/models/vienna.json
 ```
 
+Training attempts can checkpoint and exit cooperatively. The logical run keeps
+its identity while later worker attempts resume the newest committed
+checkpoint:
+
+```bash
+cargo run -p transit-cli -- train multitask \
+  --graph data/graphs/vienna \
+  --labels data/labels/vienna.jsonl \
+  --config configs/models/multitask-v1.yaml \
+  --output data/models/vienna.json \
+  --checkpoint-dir data/runs/vienna-training/checkpoints \
+  --control-file data/runs/vienna-training/control.json \
+  --checkpoint-every-steps 500 \
+  --checkpoint-every-seconds 900 \
+  --resume latest
+```
+
+Pause requests are honored after a complete optimizer step. The trainer saves
+an atomic checkpoint directory and exits, releasing its process and device;
+the worker can later start a new attempt from that directory. A resumable
+checkpoint includes model weights, optimizer moments, scheduler/scaler state,
+the cursor, sampler state, RNG state, metrics, and dataset/configuration
+fingerprints. The flat model export is a separate inference artifact: native
+LibTorch exports use `model.json` plus a sibling `.weights.ot` file and do not
+claim to be resumable by themselves.
+
 ### 9. Evaluate
 
 Training loss is not enough. Evaluation asks whether the learned features work
@@ -319,16 +345,18 @@ cross-snapshot identity pairing. Studio, Explorer, the control API, worker,
 artifact manifests, dataset manifests, server-sent run events, and provenance
 views are implemented.
 
-Dataset and evaluation artifacts are indexed and displayed as read-only
-results. The worker does not submit `build-dataset` or `evaluate` runs until
-the Rust CLI exposes stable commands and output contracts for them. It rejects
-those run kinds rather than inventing a fallback.
+Dataset, training, evaluation, benchmark, inference, and embedding artifacts
+are indexed and displayed as read-only results. The worker submits these
+commands only after their typed inputs and immutable output contracts pass
+validation. Reference-model outputs verify the pipeline; they are not evidence
+of production model quality or cross-city generalisation.
 
-The optional LibTorch backend has a differentiable forward path and a small
-masked-reconstruction training helper. The full GPU multi-task CLI,
-held-out cross-city retrieval benchmark, and validated criticality
-generalization are still being built. Reference-model outputs verify the
-pipeline; they are not evidence of production model quality.
+The optional LibTorch backend provides the differentiable relational model,
+resumable multi-task training, native model export, and CPU inference. The
+standard `tch::nn::Optimizer` wrapper remains weights-only because `tch` 0.18
+does not expose its private C++ state dictionary. The resumable session uses an
+explicit Rust-owned Adam/AdamW implementation so optimizer moments are part of
+the committed checkpoint contract.
 
 ## Quick start
 
@@ -386,9 +414,14 @@ The versioned boundary contracts live in [`schemas`](schemas):
 
 ```text
 schemas/run-event.v1.json
+schemas/run-event.v2.json
 schemas/experiment-spec.v1.json
 schemas/artifact-manifest.v1.json
 schemas/dataset-manifest.v1.json
+schemas/training-checkpoint.v1.json
+schemas/training-control.v1.json
+schemas/benchmark-result.v1.json
+schemas/evaluation-result.v1.json
 schemas/inference-result.v1.json
 schemas/publication-manifest.v1.json
 ```
@@ -409,8 +442,12 @@ code with:
 
 ```bash
 LIBTORCH=/opt/libtorch cargo build -p transit-model --features tch-backend
+# Or build and run the complete optional CLI backend:
+LIBTORCH=/opt/libtorch cargo run -p transit-cli --features tch-backend -- train multitask --help
 ```
 
-This enables the differentiable relational model modules. It does not yet
-turn the default CLI into a complete GPU multi-task training and evaluation
-workflow.
+This enables the differentiable relational model modules. The default build
+remains dependency-free and uses the reference backend; LibTorch builds add
+the native multi-task training and inference path. Verify the installed
+LibTorch version against the pinned `tch` dependency before running a real
+training job.

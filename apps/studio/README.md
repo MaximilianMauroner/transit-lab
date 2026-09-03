@@ -37,3 +37,7 @@ control API. Configure repository and artifact locations with
 `TRANSIT_LAB_ROOT`, `TRANSIT_LAB_DATA_DIR`, `TRANSIT_LAB_BINARY`, and
 `TRANSIT_LAB_DB`. Run `bun run db:push` to push the control-store schema
 explicitly. Startup repeats the same idempotent push for local databases.
+
+The browser client is a React application bundled by Bun. Tailwind CSS is
+compiled alongside the client into `public/dist` when Studio is built or
+started for the first time.

@@ -1,6 +1,6 @@
-import { createHash } from "node:crypto";
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
-import { dirname, relative, resolve, sep } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import { link, mkdir, open, readFile, stat, unlink } from "node:fs/promises";
+import { basename, dirname, relative, resolve, sep } from "node:path";
 import {
   ARTIFACT_MANIFEST_SCHEMA_VERSION,
   assertSafeId,
@@ -87,6 +87,51 @@ export async function writeArtifactManifest(path, manifest) {
   } catch (error) {
     if (error instanceof Error && error.message.startsWith("refusing to overwrite")) throw error;
   }
-  await writeFile(target, `${JSON.stringify(manifest, null, 2)}\n`, { flag: "wx" });
+
+  const encoded = `${JSON.stringify(manifest, null, 2)}\n`;
+  const temporary = resolve(
+    dirname(target),
+    `.${basename(target)}.tmp-${process.pid}-${randomUUID()}`
+  );
+  let installed = false;
+  try {
+    const file = await open(temporary, "wx");
+    try {
+      await file.writeFile(encoded);
+      await file.sync();
+    } finally {
+      await file.close();
+    }
+
+    // A hard link creates the final name without ever replacing a competing
+    // immutable manifest. The temporary file is on the same filesystem, so
+    // this is an atomic publish after the payload has been synced.
+    try {
+      await link(temporary, target);
+      installed = true;
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+    }
+  } finally {
+    try { await unlink(temporary); } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+  }
+
+  if (!installed) {
+    const existing = JSON.parse(await readFile(target, "utf8"));
+    validateArtifactManifest(existing);
+    if (stableStringify(existing) !== stableStringify(manifest)) {
+      throw new Error(`refusing to overwrite immutable artifact manifest ${target}`);
+    }
+    return existing;
+  }
+
+  // Directory fsync is available on Unix. The file itself is synced on every
+  // platform supported by Node; Windows/NTFS still gets the atomic publish.
+  if (process.platform !== "win32") {
+    const directory = await open(dirname(target), "r");
+    try { await directory.sync(); } finally { await directory.close(); }
+  }
   return manifest;
 }

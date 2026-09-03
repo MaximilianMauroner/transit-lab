@@ -18,6 +18,50 @@ use transit_model::{
     CRITICALITY_OUTPUTS,
 };
 
+pub mod checkpoint;
+pub mod control;
+pub mod embedding_cache;
+pub mod runtime;
+pub mod session;
+#[cfg(feature = "tch-backend")]
+pub mod tch_session;
+
+pub use checkpoint::{
+    checkpoint_schema_version, list_training_checkpoints, load_latest_training_checkpoint,
+    load_training_checkpoint, save_training_checkpoint, validate_checkpoint_compatibility,
+    BestMetricState, CheckpointCompatibility, CheckpointFile, CheckpointStatus,
+    MultiTaskPhaseState, OptimizerState, RngState, SamplerState, ScalerState, SchedulerState,
+    TrainingCheckpointManifest, TrainingCheckpointV1, TrainingCursor,
+    TRAINING_CHECKPOINT_SCHEMA_VERSION,
+};
+pub use control::{ControlDirective, DesiredTrainingState, TrainingControl, TrainingControlFile};
+pub use embedding_cache::{
+    build_embedding_cache, cache_path_for_output, embedding_cache_fingerprint, encoder_fingerprint,
+    graph_fingerprint, load_embedding_cache, save_embedding_cache, validate_cache_for_graphs,
+    CachedGraphEmbeddings, EmbeddingCache, EMBEDDING_CACHE_SCHEMA_VERSION,
+};
+pub use runtime::{
+    benchmark_reference_train_step, peak_resident_memory_bytes, DTypeKind, DeviceKind,
+    RuntimeConfig,
+};
+pub use session::{
+    max_wall_time, run_reference_multitask_with_policy_options, run_reference_pretraining,
+    run_reference_pretraining_multi_with_policy,
+    run_reference_pretraining_multi_with_policy_options, run_reference_pretraining_quiet,
+    run_reference_pretraining_with_policy, run_reference_pretraining_with_policy_options,
+    CheckpointMetadata, CheckpointPolicy, ReferenceTrainingOutcome, ReferenceTrainingSession,
+    ResumableMultiTaskResult,
+};
+#[cfg(feature = "tch-backend")]
+pub use tch_session::{
+    list_tch_training_checkpoints, load_tch_checkpoint, predict_tch_model,
+    run_tch_multitask_with_policy_options, run_tch_pretraining_with_policy_options,
+    save_tch_checkpoint, save_tch_model_artifact, TchCheckpointLoad, TchCheckpointState,
+    TchLineInference, TchMultiTaskPhaseState, TchMultiTaskSession, TchMultiTaskTrainingReport,
+    TchTrainingOutcome, TchTrainingReport, TchTrainingSession, TCH_CHECKPOINT_BACKEND,
+    TCH_MULTITASK_CHECKPOINT_BACKEND,
+};
+
 /// Semantic observations emitted by the training engine. The engine knows
 /// about phases and metrics, but not about JSONL files, Bun, SQLite, or HTTP.
 /// Implementations may forward these callbacks to a CLI, a test collector, or
@@ -29,6 +73,8 @@ pub trait TrainingObserver {
     fn learning_rate_changed(&mut self, _phase: &str, _step: usize, _value: f32) {}
     fn heartbeat(&mut self, _phase: &str, _step: usize) {}
     fn phase_completed(&mut self, _phase: &str) {}
+    fn checkpoint_started(&mut self, _phase: &str, _step: usize) {}
+    fn checkpoint_committed(&mut self, _phase: &str, _step: usize, _path: &Path) {}
 }
 
 #[derive(Default)]
@@ -44,6 +90,8 @@ pub struct PretrainingConfig {
     pub learning_rate: f32,
     pub weight_decay: f32,
     pub seed: u64,
+    #[serde(default)]
+    pub runtime: RuntimeConfig,
 }
 
 impl Default for PretrainingConfig {
@@ -55,6 +103,7 @@ impl Default for PretrainingConfig {
             learning_rate: 0.001,
             weight_decay: 0.00001,
             seed: 7,
+            runtime: RuntimeConfig::default(),
         }
     }
 }
@@ -95,6 +144,8 @@ pub struct MultiTaskTrainingConfig {
     pub metric_weight_decay: f32,
     pub max_triplets: usize,
     pub criticality: CriticalityTrainingConfig,
+    #[serde(default)]
+    pub runtime: RuntimeConfig,
 }
 
 impl Default for MultiTaskTrainingConfig {
@@ -108,6 +159,7 @@ impl Default for MultiTaskTrainingConfig {
             metric_weight_decay: 0.00001,
             max_triplets: 512,
             criticality: CriticalityTrainingConfig::default(),
+            runtime: RuntimeConfig::default(),
         }
     }
 }
@@ -133,6 +185,23 @@ pub struct ReferenceCheckpoint {
     pub config_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
+    /// Lineage metadata for model-only exports. The resumable checkpoint
+    /// manifest remains authoritative for training state, while this metadata
+    /// lets inventory associate a flat `model.json` with its run and dataset.
+    #[serde(
+        rename = "trainingRunId",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub training_run_id: Option<String>,
+    #[serde(
+        rename = "datasetFingerprint",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub dataset_fingerprint: Option<String>,
+    #[serde(rename = "modelId", default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -294,15 +363,40 @@ pub fn save_checkpoint(path: &Path, checkpoint: &ReferenceCheckpoint) -> Result<
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
-    fs::write(
-        path,
-        serde_json::to_vec_pretty(checkpoint).context("encoding model checkpoint")?,
-    )
-    .with_context(|| format!("writing {}", path.display()))?;
+    let encoded = serde_json::to_vec_pretty(checkpoint).context("encoding model checkpoint")?;
+    let temporary = path.with_extension(format!(
+        "{}-tmp-{}",
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("checkpoint"),
+        std::process::id()
+    ));
+    {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+            .with_context(|| format!("creating temporary checkpoint {}", temporary.display()))?;
+        file.write_all(&encoded)
+            .with_context(|| format!("writing temporary checkpoint {}", temporary.display()))?;
+        file.sync_all()
+            .with_context(|| format!("syncing temporary checkpoint {}", temporary.display()))?;
+    }
+    fs::rename(&temporary, path).with_context(|| {
+        format!(
+            "committing checkpoint {} as {}",
+            temporary.display(),
+            path.display()
+        )
+    })?;
     Ok(())
 }
 
 pub fn load_checkpoint(path: &Path) -> Result<ReferenceCheckpoint> {
+    if path.is_dir() {
+        return Ok(load_training_checkpoint(path)?.0.model);
+    }
     let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     serde_json::from_slice(&bytes).context("decoding model checkpoint")
 }
@@ -378,6 +472,75 @@ pub fn train_criticality_head_multi_with_observer(
     ))
 }
 
+/// Train a task-specific criticality head from an immutable encoder-output
+/// cache. The encoder is only used to validate the cache fingerprint; no
+/// graph encoding is performed in this function. This is the cheap experiment
+/// path used after a backbone has been frozen.
+pub fn train_criticality_head_cached_multi_with_observer(
+    encoder: &ReferenceRelationalAutoencoder,
+    datasets: &[(&GraphTensor, &[LineImpactLabel])],
+    cache: &EmbeddingCache,
+    config: &CriticalityTrainingConfig,
+    observer: &mut dyn TrainingObserver,
+) -> Result<(CriticalityHead, TrainingReport)> {
+    let graphs = datasets.iter().map(|(graph, _)| *graph).collect::<Vec<_>>();
+    validate_cache_for_graphs(cache, encoder, &graphs)?;
+    let Some((first_graph, _)) = datasets.first() else {
+        anyhow::bail!("no graph datasets were provided");
+    };
+    let first_entry = cache
+        .entry(&first_graph.manifest.snapshot_id)
+        .context("embedding cache has no first graph")?;
+    let input_dimension = first_entry
+        .embeddings
+        .line
+        .first()
+        .map(Vec::len)
+        .unwrap_or(0)
+        * 2
+        + first_graph.line_features.cols;
+    let mut head = CriticalityHead::new(input_dimension, CRITICALITY_OUTPUTS, config.seed);
+    let mut examples = Vec::new();
+    for (graph, labels) in datasets {
+        if graph.line_features.cols != first_graph.line_features.cols {
+            anyhow::bail!("graph datasets have incompatible line feature widths");
+        }
+        let entry = cache
+            .entry(&graph.manifest.snapshot_id)
+            .context("embedding cache entry disappeared during validation")?;
+        examples.extend(training_examples(&head, &entry.embeddings, graph, labels)?);
+    }
+    if examples.is_empty() {
+        anyhow::bail!("no labels match the graph snapshot datasets");
+    }
+    let (initial_loss, final_loss) = fit_criticality_head(&mut head, &examples, config, observer)?;
+    Ok((
+        head,
+        TrainingReport {
+            backend: "reference-cpu-cached-head".into(),
+            steps: config.epochs,
+            initial_loss,
+            final_loss,
+        },
+    ))
+}
+
+pub fn train_criticality_head_cached_multi(
+    encoder: &ReferenceRelationalAutoencoder,
+    datasets: &[(&GraphTensor, &[LineImpactLabel])],
+    cache: &EmbeddingCache,
+    config: &CriticalityTrainingConfig,
+) -> Result<(CriticalityHead, TrainingReport)> {
+    let mut observer = NoopTrainingObserver;
+    train_criticality_head_cached_multi_with_observer(
+        encoder,
+        datasets,
+        cache,
+        config,
+        &mut observer,
+    )
+}
+
 /// Train the complete dependency-free multi-task workflow over one or more
 /// compiled snapshots. Exact simulator labels are optional for pretraining
 /// and retrieval, but are required if a criticality head is requested.
@@ -394,12 +557,36 @@ pub fn train_reference_multitask_with_observer(
     config: &MultiTaskTrainingConfig,
     observer: &mut dyn TrainingObserver,
 ) -> Result<(ReferenceCheckpoint, MultiTaskTrainingReport)> {
-    let Some((first_graph, _)) = datasets.first() else {
+    let Some((_, _)) = datasets.first() else {
         anyhow::bail!("no graph datasets were provided");
     };
     let graphs: Vec<&GraphTensor> = datasets.iter().map(|(graph, _)| *graph).collect();
     let (encoder, pretraining_report) =
         train_reference_autoencoder_multi_with_observer(&graphs, &config.pretraining, observer)?;
+    train_reference_multitask_after_pretraining_with_observer(
+        encoder,
+        datasets,
+        config,
+        pretraining_report,
+        observer,
+    )
+}
+
+/// Complete the metric and optional criticality phases using an already
+/// trained encoder. Keeping this boundary public lets the CLI checkpoint and
+/// resume pretraining independently without repeating the expensive graph
+/// work when it promotes a run to the later phases.
+pub fn train_reference_multitask_after_pretraining_with_observer(
+    encoder: ReferenceRelationalAutoencoder,
+    datasets: &[(&GraphTensor, &[LineImpactLabel])],
+    config: &MultiTaskTrainingConfig,
+    pretraining_report: TrainingReport,
+    observer: &mut dyn TrainingObserver,
+) -> Result<(ReferenceCheckpoint, MultiTaskTrainingReport)> {
+    let Some((first_graph, _)) = datasets.first() else {
+        anyhow::bail!("no graph datasets were provided");
+    };
+    let graphs: Vec<&GraphTensor> = datasets.iter().map(|(graph, _)| *graph).collect();
     let mut embeddings = Vec::with_capacity(graphs.len());
     for graph in &graphs {
         embeddings.push(encoder.encode(graph, &MaskSelection::all_unmasked(graph))?);
@@ -436,6 +623,9 @@ pub fn train_reference_multitask_with_observer(
         representation: Some(representation),
         config_fingerprint: None,
         seed: Some(config.pretraining.seed),
+        training_run_id: std::env::var("TRANSIT_RUN_ID").ok(),
+        dataset_fingerprint: std::env::var("TRANSIT_DATASET_FINGERPRINT").ok(),
+        model_id: None,
     };
     let report = MultiTaskTrainingReport {
         backend: "reference-cpu-multitask".into(),
@@ -475,6 +665,28 @@ pub fn train_criticality_head_multi_representation_with_observer(
     config: &CriticalityTrainingConfig,
     observer: &mut dyn TrainingObserver,
 ) -> Result<(CriticalityHead, TrainingReport)> {
+    let (input_dimension, examples) =
+        build_representation_criticality_examples(representation, datasets)?;
+    let mut head = CriticalityHead::new(input_dimension, CRITICALITY_OUTPUTS, config.seed);
+    let (initial_loss, final_loss) = fit_criticality_head(&mut head, &examples, config, observer)?;
+    Ok((
+        head,
+        TrainingReport {
+            backend: "reference-cpu-representation-head".into(),
+            steps: config.epochs,
+            initial_loss,
+            final_loss,
+        },
+    ))
+}
+
+/// Build the immutable feature/target examples used by the representation
+/// criticality head.  The returned input width is independent of city size,
+/// which makes the head safe to restore across attempts.
+pub(crate) fn build_representation_criticality_examples(
+    representation: &TrainableLineRepresentationModel,
+    datasets: &[(&GraphTensor, &Embeddings, &[LineImpactLabel])],
+) -> Result<(usize, Vec<Example>)> {
     let Some((first_graph, first_embeddings, _)) = datasets.first() else {
         anyhow::bail!("no graph datasets were provided");
     };
@@ -484,7 +696,6 @@ pub fn train_criticality_head_multi_representation_with_observer(
     };
     let input_dimension =
         first_line.base.len() + first_representations.city.len() + first_graph.line_features.cols;
-    let mut head = CriticalityHead::new(input_dimension, CRITICALITY_OUTPUTS, config.seed);
     let mut examples = Vec::new();
     for (graph, embeddings, labels) in datasets {
         if graph.line_features.cols != first_graph.line_features.cols {
@@ -499,8 +710,15 @@ pub fn train_criticality_head_multi_representation_with_observer(
             let Some(embedding) = representations.lines.get(line) else {
                 continue;
             };
-            let input =
-                head.input_for_representation(embedding, &representations.city, graph, line)?;
+            let mut input = Vec::with_capacity(input_dimension);
+            input.extend(&embedding.base);
+            input.extend(&representations.city);
+            input.extend(graph.line_features.row(line));
+            if input.len() != input_dimension {
+                anyhow::bail!(
+                    "representation criticality example width does not match the first graph"
+                );
+            }
             examples.push(Example {
                 input,
                 target: normalize_criticality_targets(label_targets(label)),
@@ -512,16 +730,7 @@ pub fn train_criticality_head_multi_representation_with_observer(
     if examples.is_empty() {
         anyhow::bail!("no labels match the graph snapshot datasets");
     }
-    let (initial_loss, final_loss) = fit_criticality_head(&mut head, &examples, config, observer)?;
-    Ok((
-        head,
-        TrainingReport {
-            backend: "reference-cpu-representation-head".into(),
-            steps: config.epochs,
-            initial_loss,
-            final_loss,
-        },
-    ))
+    Ok((input_dimension, examples))
 }
 
 fn label_targets(label: &LineImpactLabel) -> [f32; CRITICALITY_OUTPUTS] {
@@ -536,7 +745,7 @@ fn label_targets(label: &LineImpactLabel) -> [f32; CRITICALITY_OUTPUTS] {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum MetricFacet {
+pub(crate) enum MetricFacet {
     Base,
     General,
     Role,
@@ -546,7 +755,7 @@ enum MetricFacet {
 }
 
 impl MetricFacet {
-    const ALL: [Self; 6] = [
+    pub(crate) const ALL: [Self; 6] = [
         Self::Base,
         Self::General,
         Self::Role,
@@ -556,7 +765,7 @@ impl MetricFacet {
     ];
 }
 
-struct RepresentationSample {
+pub(crate) struct RepresentationSample {
     raw: RawLineFeatures,
     network_system_id: String,
     stable_line_identity: Option<String>,
@@ -564,7 +773,7 @@ struct RepresentationSample {
     criticality: Option<[f32; CRITICALITY_OUTPUTS]>,
 }
 
-fn collect_representation_samples(
+pub(crate) fn collect_representation_samples(
     datasets: &[(&GraphTensor, &Embeddings, &[LineImpactLabel])],
     representation: &TrainableLineRepresentationModel,
 ) -> Result<Vec<RepresentationSample>> {
@@ -597,6 +806,16 @@ fn collect_representation_samples(
     Ok(samples)
 }
 
+pub(crate) fn build_metric_training_plan(
+    samples: &[RepresentationSample],
+    maximum: usize,
+) -> Vec<(MetricFacet, Vec<[usize; 3]>)> {
+    MetricFacet::ALL
+        .into_iter()
+        .map(|facet| (facet, build_triplets(samples, facet, maximum)))
+        .collect()
+}
+
 fn fit_metric_heads(
     representation: &mut TrainableLineRepresentationModel,
     samples: &[RepresentationSample],
@@ -605,10 +824,7 @@ fn fit_metric_heads(
 ) -> Result<(f32, f32, usize)> {
     let mut initial_loss = 0.0;
     let mut final_loss = 0.0;
-    let triplets_by_facet: Vec<(MetricFacet, Vec<[usize; 3]>)> = MetricFacet::ALL
-        .into_iter()
-        .map(|facet| (facet, build_triplets(samples, facet, config.max_triplets)))
-        .collect();
+    let triplets_by_facet = build_metric_training_plan(samples, config.max_triplets);
     let total_triplets = triplets_by_facet
         .iter()
         .map(|(_, triplets)| triplets.len())
@@ -617,88 +833,8 @@ fn fit_metric_heads(
     observer.learning_rate_changed("metric-learning", 0, config.metric_learning_rate);
     for epoch in 0..config.metric_epochs {
         observer.epoch_started("metric-learning", epoch + 1, config.metric_epochs);
-        let mut loss_sum = 0.0_f64;
-        let mut loss_count = 0_usize;
-        for (facet, triplets) in &triplets_by_facet {
-            // Inputs depend on lower-level projections (role/resilience/general),
-            // so refresh them once per facet and epoch rather than once per
-            // triplet. This is the difference between a useful CPU smoke run
-            // and repeated O(lines * dimensions) work.
-            let inputs: Vec<Vec<f32>> = samples
-                .iter()
-                .map(|sample| facet_input(representation, sample, *facet))
-                .collect::<Result<Vec<_>>>()?;
-            for [anchor, positive, negative] in triplets {
-                let anchor_input = &inputs[*anchor];
-                let positive_input = &inputs[*positive];
-                let negative_input = &inputs[*negative];
-                let (anchor_raw, positive_raw, negative_raw) = {
-                    let head = facet_head(representation, *facet);
-                    (
-                        head.forward_raw(anchor_input)?,
-                        head.forward_raw(positive_input)?,
-                        head.forward_raw(negative_input)?,
-                    )
-                };
-                let anchor_output = normalized(&anchor_raw);
-                let positive_output = normalized(&positive_raw);
-                let negative_output = normalized(&negative_raw);
-                let positive_distance = squared_distance(&anchor_output, &positive_output);
-                let negative_distance = squared_distance(&anchor_output, &negative_output);
-                let loss = config.metric_margin + positive_distance - negative_distance;
-                if !loss.is_finite() || loss <= 0.0 {
-                    continue;
-                }
-                let anchor_gradient: Vec<f32> = anchor_output
-                    .iter()
-                    .zip(&positive_output)
-                    .zip(&negative_output)
-                    .map(|((_anchor, positive), negative)| 2.0 * (negative - positive))
-                    .collect();
-                let positive_gradient: Vec<f32> = positive_output
-                    .iter()
-                    .zip(&anchor_output)
-                    .map(|(positive, anchor)| 2.0 * (positive - anchor))
-                    .collect();
-                let negative_gradient: Vec<f32> = anchor_output
-                    .iter()
-                    .zip(&negative_output)
-                    .map(|(anchor, negative)| 2.0 * (anchor - negative))
-                    .collect();
-                let anchor_gradient = normalization_gradient(&anchor_raw, &anchor_gradient);
-                let positive_gradient = normalization_gradient(&positive_raw, &positive_gradient);
-                let negative_gradient = normalization_gradient(&negative_raw, &negative_gradient);
-                let head = facet_head_mut(representation, *facet);
-                head.apply_gradient_from_activated(
-                    anchor_input,
-                    &anchor_raw,
-                    &anchor_gradient,
-                    config.metric_learning_rate,
-                    config.metric_weight_decay,
-                )?;
-                head.apply_gradient_from_activated(
-                    positive_input,
-                    &positive_raw,
-                    &positive_gradient,
-                    config.metric_learning_rate,
-                    config.metric_weight_decay,
-                )?;
-                head.apply_gradient_from_activated(
-                    negative_input,
-                    &negative_raw,
-                    &negative_gradient,
-                    config.metric_learning_rate,
-                    config.metric_weight_decay,
-                )?;
-                loss_sum += f64::from(loss);
-                loss_count += 1;
-            }
-        }
-        let epoch_loss = if loss_count == 0 {
-            0.0
-        } else {
-            (loss_sum / loss_count as f64) as f32
-        };
+        let (epoch_loss, _) =
+            fit_metric_epoch(representation, samples, &triplets_by_facet, config)?;
         if epoch == 0 {
             initial_loss = epoch_loss;
         }
@@ -725,7 +861,101 @@ fn fit_metric_heads(
     Ok((initial_loss, final_loss, total_triplets))
 }
 
-fn build_triplets(
+/// Execute one deterministic metric-learning epoch.  Keeping the epoch as a
+/// separately callable unit lets the resumable session commit state only at a
+/// complete optimizer boundary.
+pub(crate) fn fit_metric_epoch(
+    representation: &mut TrainableLineRepresentationModel,
+    samples: &[RepresentationSample],
+    triplets_by_facet: &[(MetricFacet, Vec<[usize; 3]>)],
+    config: &MultiTaskTrainingConfig,
+) -> Result<(f32, usize)> {
+    let mut loss_sum = 0.0_f64;
+    let mut loss_count = 0_usize;
+    for (facet, triplets) in triplets_by_facet {
+        // Inputs depend on lower-level projections (role/resilience/general),
+        // so refresh them once per facet and epoch rather than once per
+        // triplet. This is the difference between a useful CPU smoke run and
+        // repeated O(lines * dimensions) work.
+        let inputs: Vec<Vec<f32>> = samples
+            .iter()
+            .map(|sample| facet_input(representation, sample, *facet))
+            .collect::<Result<Vec<_>>>()?;
+        for [anchor, positive, negative] in triplets {
+            let anchor_input = &inputs[*anchor];
+            let positive_input = &inputs[*positive];
+            let negative_input = &inputs[*negative];
+            let (anchor_raw, positive_raw, negative_raw) = {
+                let head = facet_head(representation, *facet);
+                (
+                    head.forward_raw(anchor_input)?,
+                    head.forward_raw(positive_input)?,
+                    head.forward_raw(negative_input)?,
+                )
+            };
+            let anchor_output = normalized(&anchor_raw);
+            let positive_output = normalized(&positive_raw);
+            let negative_output = normalized(&negative_raw);
+            let positive_distance = squared_distance(&anchor_output, &positive_output);
+            let negative_distance = squared_distance(&anchor_output, &negative_output);
+            let loss = config.metric_margin + positive_distance - negative_distance;
+            if !loss.is_finite() || loss <= 0.0 {
+                continue;
+            }
+            let anchor_gradient: Vec<f32> = anchor_output
+                .iter()
+                .zip(&positive_output)
+                .zip(&negative_output)
+                .map(|((_anchor, positive), negative)| 2.0 * (negative - positive))
+                .collect();
+            let positive_gradient: Vec<f32> = positive_output
+                .iter()
+                .zip(&anchor_output)
+                .map(|(positive, anchor)| 2.0 * (positive - anchor))
+                .collect();
+            let negative_gradient: Vec<f32> = anchor_output
+                .iter()
+                .zip(&negative_output)
+                .map(|(anchor, negative)| 2.0 * (anchor - negative))
+                .collect();
+            let anchor_gradient = normalization_gradient(&anchor_raw, &anchor_gradient);
+            let positive_gradient = normalization_gradient(&positive_raw, &positive_gradient);
+            let negative_gradient = normalization_gradient(&negative_raw, &negative_gradient);
+            let head = facet_head_mut(representation, *facet);
+            head.apply_gradient_from_activated(
+                anchor_input,
+                &anchor_raw,
+                &anchor_gradient,
+                config.metric_learning_rate,
+                config.metric_weight_decay,
+            )?;
+            head.apply_gradient_from_activated(
+                positive_input,
+                &positive_raw,
+                &positive_gradient,
+                config.metric_learning_rate,
+                config.metric_weight_decay,
+            )?;
+            head.apply_gradient_from_activated(
+                negative_input,
+                &negative_raw,
+                &negative_gradient,
+                config.metric_learning_rate,
+                config.metric_weight_decay,
+            )?;
+            loss_sum += f64::from(loss);
+            loss_count += 1;
+        }
+    }
+    let epoch_loss = if loss_count == 0 {
+        0.0
+    } else {
+        (loss_sum / loss_count as f64) as f32
+    };
+    Ok((epoch_loss, loss_count))
+}
+
+pub(crate) fn build_triplets(
     samples: &[RepresentationSample],
     facet: MetricFacet,
     maximum: usize,
@@ -973,20 +1203,7 @@ fn fit_criticality_head(
     observer.learning_rate_changed("criticality", 0, config.learning_rate);
     for epoch in 0..config.epochs {
         observer.epoch_started("criticality", epoch + 1, config.epochs);
-        let mut epoch_loss = 0.0_f64;
-        let mut weight_sum = 0.0_f64;
-        for example in examples {
-            let prediction = head.predict_inputs(&example.input)?;
-            let mut errors = vec![0.0; head.output_dimension];
-            for output in 0..head.output_dimension.min(CRITICALITY_OUTPUTS) {
-                let error = prediction[output] - example.target[output];
-                errors[output] = huber_gradient(error) * example.weight;
-                epoch_loss += f64::from(huber_loss(error) * example.weight);
-            }
-            weight_sum += f64::from(example.weight);
-            update_head(head, &example.input, &errors, config.learning_rate);
-        }
-        epoch_loss /= weight_sum.max(f64::EPSILON);
+        let epoch_loss = fit_criticality_epoch(head, examples, config)? as f64;
         if epoch == 0 {
             initial_loss = epoch_loss as f32;
         }
@@ -1001,21 +1218,45 @@ fn fit_criticality_head(
         if epoch % 10 == 0 || epoch + 1 == config.epochs {
             observer.heartbeat("criticality", epoch + 1);
         }
-        if config.ranking_weight > 0.0 {
-            apply_pairwise_ranking(
-                head,
-                examples,
-                config.learning_rate,
-                config.ranking_weight,
-                config.max_ranking_pairs,
-            );
-        }
     }
     observer.phase_completed("criticality");
     Ok((initial_loss, final_loss))
 }
 
-struct Example {
+/// Execute one complete criticality epoch, including the optional pairwise
+/// ranking update.  The caller owns the phase cursor and may checkpoint after
+/// this function returns.
+pub(crate) fn fit_criticality_epoch(
+    head: &mut CriticalityHead,
+    examples: &[Example],
+    config: &CriticalityTrainingConfig,
+) -> Result<f32> {
+    let mut epoch_loss = 0.0_f64;
+    let mut weight_sum = 0.0_f64;
+    for example in examples {
+        let prediction = head.predict_inputs(&example.input)?;
+        let mut errors = vec![0.0; head.output_dimension];
+        for output in 0..head.output_dimension.min(CRITICALITY_OUTPUTS) {
+            let error = prediction[output] - example.target[output];
+            errors[output] = huber_gradient(error) * example.weight;
+            epoch_loss += f64::from(huber_loss(error) * example.weight);
+        }
+        weight_sum += f64::from(example.weight);
+        update_head(head, &example.input, &errors, config.learning_rate);
+    }
+    if config.ranking_weight > 0.0 {
+        apply_pairwise_ranking(
+            head,
+            examples,
+            config.learning_rate,
+            config.ranking_weight,
+            config.max_ranking_pairs,
+        );
+    }
+    Ok((epoch_loss / weight_sum.max(f64::EPSILON)) as f32)
+}
+
+pub(crate) struct Example {
     input: Vec<f32>,
     target: [f32; CRITICALITY_OUTPUTS],
     weight: f32,
@@ -1166,91 +1407,7 @@ fn update_single_output(
 
 #[cfg(feature = "tch-backend")]
 pub mod tch_training {
-    use super::*;
-    use tch::nn::OptimizerConfig;
-    use tch::{Device, Kind, Tensor};
-    use transit_model::tch_backend::TchRelationalAutoencoder;
-
-    #[derive(Clone, Debug, Serialize, Deserialize)]
-    pub struct TchTrainingReport {
-        pub backend: String,
-        pub steps: usize,
-        pub initial_loss: f64,
-        pub final_loss: f64,
-    }
-
-    pub fn train_tch_autoencoder(
-        graph: &GraphTensor,
-        config: &PretrainingConfig,
-        device: Device,
-        checkpoint: Option<&Path>,
-    ) -> Result<TchTrainingReport> {
-        let model = TchRelationalAutoencoder::new(device, graph, &config.model);
-        let mut optimizer = tch::nn::Adam::default()
-            .wd(config.weight_decay as f64)
-            .build(&model.var_store, config.learning_rate as f64)
-            .context("building LibTorch Adam optimizer")?;
-        let mut initial_loss = 0.0;
-        let mut final_loss = 0.0;
-        for step in 0..config.steps {
-            let mask =
-                MaskSelection::sample(graph, &config.mask, config.seed.wrapping_add(step as u64));
-            let reconstruction = model.forward(graph, &mask, true)?;
-            let station_target = Tensor::from_slice(&graph.station_features.values)
-                .to_device(device)
-                .reshape([
-                    graph.station_features.rows as i64,
-                    graph.station_features.cols as i64,
-                ]);
-            let line_target = Tensor::from_slice(&graph.line_features.values)
-                .to_device(device)
-                .reshape([
-                    graph.line_features.rows as i64,
-                    graph.line_features.cols as i64,
-                ]);
-            let station_loss = masked_mse(
-                &reconstruction.station_features,
-                &station_target,
-                &mask.station_rows,
-                device,
-            );
-            let line_loss = masked_mse(
-                &reconstruction.line_features,
-                &line_target,
-                &mask.line_rows,
-                device,
-            );
-            let loss = station_loss + line_loss;
-            let value = loss.double_value(&[]);
-            if step == 0 {
-                initial_loss = value;
-            }
-            final_loss = value;
-            optimizer.backward_step(&loss);
-        }
-        if let Some(path) = checkpoint {
-            model.save(path)?;
-        }
-        Ok(TchTrainingReport {
-            backend: "tch-rs-libtorch".into(),
-            steps: config.steps,
-            initial_loss,
-            final_loss,
-        })
-    }
-
-    fn masked_mse(prediction: &Tensor, target: &Tensor, rows: &[bool], device: Device) -> Tensor {
-        let row_mask = Tensor::from_slice(
-            &rows
-                .iter()
-                .map(|masked| if *masked { 1.0_f32 } else { 0.0 })
-                .collect::<Vec<_>>(),
-        )
-        .to_device(device)
-        .unsqueeze(1);
-        let difference = (prediction - target) * &row_mask;
-        (&difference * &difference).sum(Kind::Float) / row_mask.sum(Kind::Float).clamp_min(1.0)
-    }
+    pub use crate::tch_session::{train_tch_autoencoder, TchTrainingReport};
 }
 
 #[cfg(test)]

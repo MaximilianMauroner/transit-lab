@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://transit-lab.local/schemas/benchmark-result.v1.json",
+  "title": "Transit Lab benchmark result v1",
+  "type": "object",
+  "required": ["schemaVersion", "benchmark", "workload"],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "benchmark": {"enum": ["routing", "train-step", "threads"]},
+    "workload": {"enum": ["routing", "train-step", "mixed"]},
+    "snapshotId": {"type": ["string", "null"]},
+    "graphId": {"type": ["string", "null"]},
+    "warmupUnits": {"type": "integer", "minimum": 0},
+    "measuredUnits": {"type": "integer", "minimum": 0},
+    "estimatedWorkUnits": {"type": "integer", "minimum": 0},
+    "medianMilliseconds": {"type": "number", "minimum": 0},
+    "p95Milliseconds": {"type": "number", "minimum": 0},
+    "throughput": {"type": "number", "minimum": 0},
+    "throughputUnit": {"type": "string", "minLength": 1},
+    "peakResidentMemoryBytes": {"type": ["integer", "null"], "minimum": 0},
+    "graphCounts": {"type": "object"},
+    "runtime": {"type": "object"},
+    "threadConfiguration": {"type": "object"},
+    "reports": {"type": "array", "items": {"type": "object"}},
+    "createdAt": {"type": "string", "format": "date-time"}
+  },
+  "additionalProperties": true
+}

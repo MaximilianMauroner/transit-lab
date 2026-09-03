@@ -42,7 +42,7 @@ async function proxyApi(request) {
 
 export async function createExplorerServer({ port = Number(process.env.EXPLORER_PORT || 3200) } = {}) {
   const publicRoot = resolve(import.meta.dir, "../../public");
-  if (!(await Bun.file(resolve(publicRoot, "dist/app.js")).exists())) {
+  if (!(await Bun.file(resolve(publicRoot, "dist/app.js")).exists()) || !(await Bun.file(resolve(publicRoot, "dist/styles.css")).exists())) {
     const result = await buildExplorerClient(resolve(publicRoot, "dist"));
     if (!result.success) throw new Error(`Explorer client build failed: ${result.logs.map((log) => log.message).join("\n")}`);
   }

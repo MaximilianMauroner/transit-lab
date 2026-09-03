@@ -25,7 +25,15 @@
     "check:packages": "bun run --cwd packages/contracts check && bun run --cwd packages/control-store check && bun run --cwd packages/api-client check && bun run --cwd packages/ui check && bun run --cwd packages/visualizations check"
   },
   "devDependencies": {
+    "@tailwindcss/cli": "^4.1.13",
+    "@types/react": "^19.1.12",
+    "@types/react-dom": "^19.1.9",
     "bun-types": "^1.3.0",
+    "tailwindcss": "^4.1.13",
     "typescript": "^5.9.2"
+  },
+  "dependencies": {
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1"
   }
 }

@@ -3,7 +3,7 @@ import { copyFile, mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createDatabase, one, run } from "../../../packages/control-store/src/database.ts";
+import { createDatabase, listBenchmarks, one, run } from "../../../packages/control-store/src/database.ts";
 import { createApiHandler } from "../../api/src/routes.ts";
 import { createArtifactManifest, describeArtifactFile, writeArtifactManifest } from "../../../packages/control-store/src/manifest.ts";
 import { findArtifact, syncFilesystem } from "../../../packages/control-store/src/inventory.ts";
@@ -95,20 +95,59 @@ test("resolved experiment configs are immutable and propagate the submitted seed
   })).toThrow("immutable resolved config");
 });
 
-test("unsupported dataset and evaluation runs do not get fallback Rust commands", () => {
-  const root = process.cwd();
-  expect(() => buildRustCommand({
+test("dataset and evaluation runs use indexed immutable inputs", async () => {
+  const root = await mkdtemp(join(tmpdir(), "transit-lab-command-root-"));
+  const db = createDatabase(root, ":memory:");
+  run(db, "INSERT INTO projects(id, name, created_at) VALUES ('project-local', 'Transit Lab', '2026-09-02T00:00:00Z')");
+  run(db, "INSERT INTO networks(id, project_id, display_name, created_at, updated_at) VALUES ('demo', 'project-local', 'Demo', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z')");
+  run(db, `INSERT INTO snapshots(id, network_id, service_date, status, fingerprint, manifest_path, network_path, graph_path, created_at, updated_at)
+    VALUES ('snapshot-1', 'demo', '2026-09-02', 'ready', 'snapshot-fingerprint', 'data/demo/snapshot/manifest.json', 'data/demo/snapshot/network.json', 'data/demo/graph', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z')`);
+  const datasetRoot = join(root, "data", "dataset-1");
+  await mkdir(datasetRoot, { recursive: true });
+  await mkdir(join(datasetRoot, "graph"), { recursive: true });
+  await writeFile(join(datasetRoot, "dataset-manifest.json"), JSON.stringify({
+    schemaVersion: 1,
+    datasetId: "dataset-1",
+    fingerprint: "dataset-fingerprint",
+    featureSchema: "station-line-relational-v2",
+    snapshotIds: ["snapshot-1"],
+    split: { strategy: "system-level" },
+    objectives: {},
+    graphDirectory: "graph",
+    labelFile: "labels.jsonl"
+  }));
+  run(db, `INSERT INTO datasets(id, fingerprint, status, manifest_path, feature_schema, created_at, updated_at)
+    VALUES ('dataset-1', 'dataset-fingerprint', 'ready', ?, 'station-line-relational-v2', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z')`, [datasetRoot + "/dataset-manifest.json"]);
+  const modelPath = join(datasetRoot, "model.json");
+  await writeFile(modelPath, "model");
+  run(db, `INSERT INTO artifacts(id, kind, fingerprint, uri, local_path, created_at)
+    VALUES ('artifact-model', 'model-checkpoint', 'artifact-fingerprint', ?, ?, '2026-09-02T00:00:00Z')`, [modelPath, modelPath]);
+  run(db, `INSERT INTO model_versions(id, version, fingerprint, status, dataset_id, checkpoint_artifact_id, created_at)
+    VALUES ('model-1', 'v1', 'model-fingerprint', 'ready', 'dataset-1', 'artifact-model', '2026-09-02T00:00:00Z')`);
+
+  const datasetCommand = buildRustCommand({
+    db,
     root,
     runId: "run-1",
     spec: { kind: "build-dataset", snapshotIds: ["snapshot-1"] },
     binary: "transit"
-  })).toThrow("build-dataset is not exposed");
-  expect(() => buildRustCommand({
+  });
+  expect(datasetCommand.argv).toEqual([
+    "transit", "build-dataset", "--graph", "data/demo/graph", "--output", "data/runs/run-1/dataset"
+  ]);
+
+  const evaluationCommand = buildRustCommand({
+    db,
     root,
     runId: "run-1",
-    spec: { kind: "evaluate", modelId: "model-1" },
+    spec: { kind: "evaluate", modelId: "model-1", evaluationSuite: { split: "test", topK: 5, seed: 19 } },
     binary: "transit"
-  })).toThrow("evaluate is not exposed");
+  });
+  expect(evaluationCommand.argv).toEqual([
+    "transit", "evaluate", "--dataset", "data/dataset-1", "--model", "data/dataset-1/model.json", "--model-id", "model-1",
+    "--output", "data/runs/run-1/evaluation.json", "--split", "test", "--top-k", "5", "--seed", "19"
+  ]);
+  db.close();
 });
 
 test("artifact manifests include hashes and immutable file locations", async () => {
@@ -128,7 +167,13 @@ test("artifact manifests include hashes and immutable file locations", async () 
   const manifestPath = join(root, "artifact-manifest.json");
   await writeArtifactManifest(manifestPath, manifest);
   await writeArtifactManifest(manifestPath, manifest);
+  const concurrentPath = join(root, "concurrent-artifact-manifest.json");
+  await Promise.all([
+    writeArtifactManifest(concurrentPath, manifest),
+    writeArtifactManifest(concurrentPath, manifest)
+  ]);
   expect(JSON.parse(await Bun.file(manifestPath).text()).schemaVersion).toBe(1);
+  expect(JSON.parse(await Bun.file(concurrentPath).text()).fingerprint).toBe("fingerprint-1");
 });
 
 test("Studio preserves Rust-owned inference percentiles and structural scores", async () => {
@@ -224,5 +269,167 @@ test("filesystem ingestion reuses explicit manifests and preserves camelCase inf
     metricPercentiles: [0.8, 0.6],
     structuralUniqueness: 0.7
   });
+  db.close();
+});
+
+test("filesystem ingestion keeps a native multi-file model artifact intact", async () => {
+  const root = await mkdtemp(join(tmpdir(), "transit-lab-native-model-ingestion-"));
+  const modelDirectory = join(root, "data/models/native");
+  await mkdir(modelDirectory, { recursive: true });
+  const modelPath = join(modelDirectory, "model.json");
+  const weightsPath = join(modelDirectory, "model.weights.ot");
+  await writeFile(modelPath, JSON.stringify({ backend: "libtorch", modelId: "native-model" }));
+  await writeFile(weightsPath, "native weights");
+  const manifest = await createArtifactManifest({
+    root,
+    artifactId: "artifact-native-model",
+    kind: "model-checkpoint",
+    fingerprint: "native-model-artifact-fingerprint",
+    files: [
+      await describeArtifactFile(root, modelPath),
+      await describeArtifactFile(root, weightsPath)
+    ]
+  });
+  await writeArtifactManifest(join(modelDirectory, "artifact-manifest.json"), manifest);
+
+  const db = createDatabase(root, ":memory:");
+  await syncFilesystem(db, root);
+
+  expect(one(db, "SELECT COUNT(*) AS count FROM artifacts WHERE kind = 'model-checkpoint'").count).toBe(1);
+  expect(findArtifact(db, "artifact-native-model")).toMatchObject({
+    id: "artifact-native-model",
+    uri: "data/models/native/model.json",
+    files: expect.arrayContaining([
+      expect.objectContaining({ path: "data/models/native/model.json" }),
+      expect.objectContaining({ path: "data/models/native/model.weights.ot" })
+    ])
+  });
+  await syncFilesystem(db, root);
+  expect(one(db, "SELECT COUNT(*) AS count FROM artifacts WHERE kind = 'model-checkpoint'").count).toBe(1);
+  db.close();
+});
+
+test("filesystem ingestion indexes evaluation metrics and exposes them through the API", async () => {
+  const root = await mkdtemp(join(tmpdir(), "transit-lab-evaluation-ingestion-"));
+  const evaluationDirectory = join(root, "data/evaluations/evaluation-1");
+  await mkdir(evaluationDirectory, { recursive: true });
+  await writeFile(join(evaluationDirectory, "dataset-manifest.json"), JSON.stringify({
+    schemaVersion: 1,
+    datasetId: "dataset-1",
+    fingerprint: "dataset-fingerprint",
+    featureSchema: "station-line-relational-v2",
+    snapshotIds: ["snapshot-1"],
+    split: { strategy: "system-level" },
+    objectives: {}
+  }));
+  const resultPath = join(evaluationDirectory, "evaluation.json");
+  await writeFile(resultPath, JSON.stringify({
+    schemaVersion: 1,
+    datasetId: "dataset-1",
+    datasetFingerprint: "dataset-fingerprint",
+    modelId: "model-1",
+    modelPath: "data/models/model.json",
+    split: "test",
+    topK: 5,
+    trainingExamples: 8,
+    fitExamples: 8,
+    metrics: [{
+      baseline: "gnn",
+      values: { examples: 2, snapshots: 1, spearman: 0.5, pairwiseAccuracy: 0.75, topKOverlap: 1 }
+    }]
+  }));
+  const manifest = await createArtifactManifest({
+    root,
+    artifactId: "artifact-evaluation-1",
+    kind: "evaluation-result",
+    fingerprint: "evaluation-artifact-fingerprint",
+    files: [await describeArtifactFile(root, resultPath)]
+  });
+  await writeArtifactManifest(join(evaluationDirectory, "artifact-manifest.json"), manifest);
+
+  const db = createDatabase(root, ":memory:");
+  const timestamp = "2026-09-02T00:00:00.000Z";
+  run(db, "INSERT INTO model_versions(id, version, fingerprint, status, created_at) VALUES (?, ?, ?, 'ready', ?)", ["model-1", "test", "model-fingerprint", timestamp]);
+  await syncFilesystem(db, root);
+
+  expect(one(db, "SELECT COUNT(*) AS count FROM evaluation_results").count).toBe(1);
+  expect(one(db, "SELECT COUNT(*) AS count FROM metric_points WHERE evaluation_id IS NOT NULL").count).toBe(5);
+  const response = await createApiHandler({ db, root })(new Request("http://studio/api/evaluations"));
+  expect(response.status).toBe(200);
+  const evaluations = await response.json();
+  expect(evaluations.find((row) => row.metricName === "spearman")).toMatchObject({
+    kind: "ranking",
+    facet: "gnn",
+    metricName: "spearman",
+    value: 0.5,
+    datasetId: "dataset-1",
+    modelId: "model-1",
+    split: "test"
+  });
+  db.close();
+});
+
+test("filesystem ingestion indexes benchmark throughput and exposes ETA inputs", async () => {
+  const root = await mkdtemp(join(tmpdir(), "transit-lab-benchmark-ingestion-"));
+  const benchmarkDirectory = join(root, "data/benchmarks/benchmark-1");
+  await mkdir(benchmarkDirectory, { recursive: true });
+  const resultPath = join(benchmarkDirectory, "benchmark.json");
+  await writeFile(resultPath, JSON.stringify({
+    schemaVersion: 1,
+    benchmark: "threads",
+    workload: "mixed",
+    reports: [
+      {
+        benchmark: "threads",
+        workload: "routing",
+        snapshotId: "snapshot-1",
+        threadCount: 4,
+        warmupUnits: 2,
+        measuredUnits: 10,
+        medianMilliseconds: 10,
+        p95Milliseconds: 15,
+        throughput: 100,
+        throughputUnit: "queries_per_second"
+      },
+      {
+        benchmark: "threads",
+        workload: "train-step",
+        graphId: "snapshot-1",
+        threadCount: 4,
+        warmupUnits: 2,
+        measuredUnits: 10,
+        medianMilliseconds: 20,
+        p95Milliseconds: 25,
+        throughput: 50,
+        throughputUnit: "steps_per_second"
+      }
+    ]
+  }));
+  const manifest = await createArtifactManifest({
+    root,
+    artifactId: "artifact-benchmark-1",
+    kind: "benchmark-result",
+    fingerprint: "benchmark-artifact-fingerprint",
+    files: [await describeArtifactFile(root, resultPath)]
+  });
+  await writeArtifactManifest(join(benchmarkDirectory, "artifact-manifest.json"), manifest);
+
+  const db = createDatabase(root, ":memory:");
+  await syncFilesystem(db, root);
+
+  expect(listBenchmarks(db, { workload: "train-step" })).toMatchObject([{
+    artifactId: "artifact-benchmark-1",
+    graphId: "snapshot-1",
+    throughput: 50,
+    throughputUnit: "steps_per_second"
+  }]);
+  const response = await createApiHandler({ db, root })(new Request("http://studio/api/benchmarks?workload=routing"));
+  expect(response.status).toBe(200);
+  expect(await response.json()).toMatchObject([{
+    workload: "routing",
+    snapshotId: "snapshot-1",
+    throughput: 100,
+    throughputUnit: "queries_per_second"
+  }]);
   db.close();
 });

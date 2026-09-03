@@ -5,11 +5,17 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+tch-backend = ["transit-training/tch-backend"]
+tch-doc-only = ["tch-backend", "transit-training/tch-doc-only"]
+
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
 serde_json.workspace = true
+serde.workspace = true
 transit-dataset = { path = "../transit-dataset" }
 transit-domain = { path = "../transit-domain" }
 gtfs-compile = { path = "../gtfs-compile" }

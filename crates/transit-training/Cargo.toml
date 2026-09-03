@@ -13,6 +13,7 @@ tch-doc-only = ["tch-backend", "transit-model/tch-doc-only", "tch/doc-only"]
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
+sha2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
@@ -21,3 +22,8 @@ transit-graph = { path = "../transit-graph" }
 transit-labels = { path = "../transit-labels" }
 transit-model = { path = "../transit-model" }
 tch = { version = "0.18", optional = true }
+
+[dev-dependencies]
+gtfs-compile = { path = "../gtfs-compile" }
+gtfs-ingest = { path = "../gtfs-ingest" }
+tempfile.workspace = true

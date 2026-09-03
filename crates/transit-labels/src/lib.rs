@@ -3,11 +3,14 @@
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use transit_domain::{hex_digest, sha256_bytes, LineIndex, StationIndex, INF_TIME};
-use transit_router::{OneToAllResult, Router};
+use transit_router::{OneToAllResult, Router, RouterConfig};
+
+pub const ROUTING_BASELINE_SCHEMA_VERSION: &str = "routing-baseline-v1";
+pub const LABEL_BATCH_SCHEMA_VERSION: &str = "label-batch-v1";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LabelGenerationConfig {
@@ -50,6 +53,26 @@ pub struct LabelManifest {
     pub policy_fingerprint: String,
     pub config: LabelGenerationConfig,
     pub origin_count: usize,
+    #[serde(default)]
+    pub snapshot_id: String,
+    #[serde(default)]
+    pub departure_times_seconds: Vec<u32>,
+}
+
+/// Durable progress for an append-only counterfactual label batch.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LabelBatchManifest {
+    pub schema_version: String,
+    pub snapshot_id: String,
+    pub policy_fingerprint: String,
+    pub config: LabelGenerationConfig,
+    pub origins: Vec<StationIndex>,
+    pub departure_times_seconds: Vec<u32>,
+    pub router_config: RouterConfig,
+    pub baseline_fingerprint: String,
+    pub line_count: usize,
+    pub completed_lines: Vec<LineIndex>,
+    pub status: String,
 }
 
 pub fn label_policy_fingerprint(config: &LabelGenerationConfig) -> String {
@@ -89,11 +112,135 @@ pub struct LineImpactLabel {
     pub policy_fingerprint: String,
 }
 
-#[derive(Clone, Debug)]
-struct BaselineQuery {
-    origin: StationIndex,
-    departure: u32,
-    result: OneToAllResult,
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RoutingBaselineQuery {
+    pub origin: StationIndex,
+    pub departure: u32,
+    pub result: OneToAllResult,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RoutingBaseline {
+    pub schema_version: String,
+    pub snapshot_id: String,
+    pub origins: Vec<StationIndex>,
+    pub departures: Vec<u32>,
+    pub router_config: RouterConfig,
+    pub queries: Vec<RoutingBaselineQuery>,
+    pub fingerprint: String,
+}
+
+impl RoutingBaseline {
+    pub fn validate(&self, router: &Router) -> Result<()> {
+        if self.schema_version != ROUTING_BASELINE_SCHEMA_VERSION {
+            anyhow::bail!(
+                "unsupported routing baseline schema {}; expected {}",
+                self.schema_version,
+                ROUTING_BASELINE_SCHEMA_VERSION
+            );
+        }
+        if self.router_config.maximum_transfers != router.config.maximum_transfers
+            || self.router_config.maximum_journey_seconds != router.config.maximum_journey_seconds
+        {
+            anyhow::bail!("routing baseline was generated with a different router configuration");
+        }
+        if self.queries.len() != self.origins.len().saturating_mul(self.departures.len()) {
+            anyhow::bail!("routing baseline query count does not match its origin/departure grid");
+        }
+        if self.queries.iter().any(|query| {
+            query.result.arrival_seconds.len() != router.data.station_count
+                || query.result.transfers.len() != router.data.station_count
+        }) {
+            anyhow::bail!("routing baseline contains a result with the wrong station count");
+        }
+        Ok(())
+    }
+}
+
+pub fn build_routing_baseline(
+    router: &Router,
+    snapshot: impl Into<String>,
+    origins: &[StationIndex],
+    departures: &[u32],
+) -> RoutingBaseline {
+    let origins = select_origins(origins, origins.len(), router.data.station_count);
+    let departures = departures.to_vec();
+    let queries = origins
+        .iter()
+        .copied()
+        .flat_map(|origin| {
+            departures
+                .iter()
+                .copied()
+                .map(move |departure| (origin, departure))
+        })
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .map_init(
+            || router.workspace(),
+            |workspace, (origin, departure)| RoutingBaselineQuery {
+                origin,
+                departure,
+                result: router.one_to_all_with_workspace(
+                    origin,
+                    departure,
+                    &transit_domain::LineMask::empty(router.data.line_count),
+                    workspace,
+                ),
+            },
+        )
+        .collect::<Vec<_>>();
+    let snapshot_id = snapshot.into();
+    let mut baseline = RoutingBaseline {
+        schema_version: ROUTING_BASELINE_SCHEMA_VERSION.into(),
+        snapshot_id,
+        origins,
+        departures,
+        router_config: router.config.clone(),
+        queries,
+        fingerprint: String::new(),
+    };
+    baseline.fingerprint = routing_baseline_fingerprint(&baseline);
+    baseline
+}
+
+pub fn routing_baseline_fingerprint(baseline: &RoutingBaseline) -> String {
+    let mut value = baseline.clone();
+    value.fingerprint.clear();
+    let bytes = serde_json::to_vec(&value).expect("routing baseline is serializable");
+    hex_digest(&sha256_bytes(&bytes))
+}
+
+pub fn save_routing_baseline(path: &Path, baseline: &RoutingBaseline) -> Result<()> {
+    baseline.validate_fingerprint()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let encoded = serde_json::to_vec_pretty(baseline).context("encoding routing baseline")?;
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    fs::write(&temporary, encoded)
+        .with_context(|| format!("writing temporary baseline {}", temporary.display()))?;
+    fs::rename(&temporary, path)
+        .with_context(|| format!("committing routing baseline {}", path.display()))?;
+    Ok(())
+}
+
+pub fn load_routing_baseline(path: &Path, router: &Router) -> Result<RoutingBaseline> {
+    let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let baseline: RoutingBaseline = serde_json::from_slice(&bytes)
+        .with_context(|| format!("decoding routing baseline {}", path.display()))?;
+    baseline.validate(router)?;
+    baseline.validate_fingerprint()?;
+    Ok(baseline)
+}
+
+impl RoutingBaseline {
+    fn validate_fingerprint(&self) -> Result<()> {
+        if self.fingerprint != routing_baseline_fingerprint(self) {
+            anyhow::bail!("routing baseline fingerprint does not match its contents");
+        }
+        Ok(())
+    }
 }
 
 pub fn generate_line_removal_labels(
@@ -120,6 +267,7 @@ pub fn generate_selected_line_removal_labels(
     config: &LabelGenerationConfig,
     selected_lines: &[LineIndex],
 ) -> Vec<LineImpactLabel> {
+    let snapshot = snapshot.into();
     let origins = select_origins(origins, config.maximum_origins, router.data.station_count);
     if origins.is_empty() || departures.is_empty() || router.data.line_count == 0 {
         return Vec::new();
@@ -134,103 +282,121 @@ pub fn generate_selected_line_removal_labels(
     if lines.is_empty() {
         return Vec::new();
     }
-    let queries: Vec<(StationIndex, u32)> = origins
+    let baseline = build_routing_baseline(router, snapshot.clone(), &origins, departures);
+    generate_selected_line_removal_labels_from_baseline(router, snapshot, config, &lines, &baseline)
+}
+
+/// Generate counterfactual rows from a previously materialized intact-network
+/// baseline. This is the normal path for experiments: changing a line subset
+/// no longer recomputes the expensive intact route queries.
+pub fn generate_selected_line_removal_labels_from_baseline(
+    router: &Router,
+    snapshot: impl Into<String>,
+    config: &LabelGenerationConfig,
+    selected_lines: &[LineIndex],
+    baseline: &RoutingBaseline,
+) -> Vec<LineImpactLabel> {
+    let snapshot = snapshot.into();
+    if baseline.snapshot_id != snapshot
+        || baseline.validate(router).is_err()
+        || baseline.origins.is_empty()
+        || baseline.departures.is_empty()
+    {
+        return Vec::new();
+    }
+    let mut lines = selected_lines
         .iter()
         .copied()
-        .flat_map(|origin| {
-            departures
-                .iter()
-                .copied()
-                .map(move |departure| (origin, departure))
-        })
-        .collect();
-    let baselines: Vec<BaselineQuery> = queries
-        .par_iter()
-        .map(|(origin, departure)| BaselineQuery {
-            origin: *origin,
-            departure: *departure,
-            result: router.one_to_all(
-                *origin,
-                *departure,
-                &transit_domain::LineMask::empty(router.data.line_count),
-            ),
-        })
-        .collect();
-    let snapshot = snapshot.into();
+        .filter(|line| (line.0 as usize) < router.data.line_count)
+        .collect::<Vec<_>>();
+    lines.sort_unstable();
+    lines.dedup();
+    if lines.is_empty() {
+        return Vec::new();
+    }
     let policy_fingerprint = label_policy_fingerprint(config);
     lines
         .into_par_iter()
-        .map(|line_index| {
-            let stations_losing_all_service_share =
-                station_losing_all_service_share(router, line_index);
-            let mut auc_loss = 0.0;
-            let mut unreachable = 0_u64;
-            let mut baseline_reachable = 0_u64;
-            let mut delay_values = Vec::new();
-            let mut extra_transfer_sum = 0.0_f64;
-            let mut extra_transfer_count = 0_u64;
+        .map_init(
+            || router.workspace(),
+            |workspace, line_index| {
+                let stations_losing_all_service_share =
+                    station_losing_all_service_share(router, line_index);
+                let mut auc_loss = 0.0;
+                let mut unreachable = 0_u64;
+                let mut baseline_reachable = 0_u64;
+                let mut delay_values = Vec::new();
+                let mut extra_transfer_sum = 0.0_f64;
+                let mut extra_transfer_count = 0_u64;
 
-            for baseline in &baselines {
-                let disrupted = router.one_to_all(
-                    baseline.origin,
-                    baseline.departure,
-                    &transit_domain::LineMask::single(router.data.line_count, line_index),
-                );
-                let destination_count = baseline.result.arrival_seconds.len().max(1) as f64;
-                for threshold in &config.accessibility_thresholds_seconds {
-                    let intact = count_within(&baseline.result, baseline.departure, *threshold)
-                        as f64
-                        / destination_count;
-                    let damaged = count_within(&disrupted, baseline.departure, *threshold) as f64
-                        / destination_count;
-                    auc_loss += (intact - damaged).max(0.0)
-                        / config.accessibility_thresholds_seconds.len().max(1) as f64;
+                for baseline in &baseline.queries {
+                    let disrupted = router.one_to_all_with_workspace(
+                        baseline.origin,
+                        baseline.departure,
+                        &transit_domain::LineMask::single(router.data.line_count, line_index),
+                        workspace,
+                    );
+                    let destination_count = baseline.result.arrival_seconds.len().max(1) as f64;
+                    for threshold in &config.accessibility_thresholds_seconds {
+                        let intact = count_within(&baseline.result, baseline.departure, *threshold)
+                            as f64
+                            / destination_count;
+                        let damaged = count_within(&disrupted, baseline.departure, *threshold)
+                            as f64
+                            / destination_count;
+                        auc_loss += (intact - damaged).max(0.0)
+                            / config.accessibility_thresholds_seconds.len().max(1) as f64;
+                    }
+                    for destination in 0..baseline.result.arrival_seconds.len() {
+                        let intact_arrival = baseline.result.arrival_seconds[destination];
+                        if intact_arrival == INF_TIME {
+                            continue;
+                        }
+                        baseline_reachable += 1;
+                        let damaged_arrival = disrupted.arrival_seconds[destination];
+                        if damaged_arrival == INF_TIME {
+                            unreachable += 1;
+                            continue;
+                        }
+                        delay_values.push(damaged_arrival.saturating_sub(intact_arrival) as f32);
+                        let intact_transfers = baseline.result.transfers[destination];
+                        let damaged_transfers = disrupted.transfers[destination];
+                        if intact_transfers != u8::MAX && damaged_transfers != u8::MAX {
+                            extra_transfer_sum +=
+                                damaged_transfers.saturating_sub(intact_transfers) as f64;
+                            extra_transfer_count += 1;
+                        }
+                    }
                 }
-                for destination in 0..baseline.result.arrival_seconds.len() {
-                    let intact_arrival = baseline.result.arrival_seconds[destination];
-                    if intact_arrival == INF_TIME {
-                        continue;
-                    }
-                    baseline_reachable += 1;
-                    let damaged_arrival = disrupted.arrival_seconds[destination];
-                    if damaged_arrival == INF_TIME {
-                        unreachable += 1;
-                        continue;
-                    }
-                    delay_values.push(damaged_arrival.saturating_sub(intact_arrival) as f32);
-                    let intact_transfers = baseline.result.transfers[destination];
-                    let damaged_transfers = disrupted.transfers[destination];
-                    if intact_transfers != u8::MAX && damaged_transfers != u8::MAX {
-                        extra_transfer_sum +=
-                            damaged_transfers.saturating_sub(intact_transfers) as f64;
-                        extra_transfer_count += 1;
-                    }
+                delay_values.sort_by(f32::total_cmp);
+                let p95_index = if delay_values.is_empty() {
+                    0
+                } else {
+                    ((delay_values.len() as f32 * 0.95).ceil() as usize)
+                        .saturating_sub(1)
+                        .min(delay_values.len() - 1)
+                };
+                let delay_sum: f32 = delay_values.iter().sum();
+                let unreachable_share = unreachable as f32 / baseline_reachable.max(1) as f32;
+                LineImpactLabel {
+                    snapshot: snapshot.clone(),
+                    line: line_index,
+                    accessibility_auc_loss: (auc_loss / baseline.queries.len().max(1) as f64)
+                        as f32,
+                    unreachable_share,
+                    mean_delay_reachable_seconds: delay_sum / delay_values.len().max(1) as f32,
+                    p95_delay_reachable_seconds: delay_values
+                        .get(p95_index)
+                        .copied()
+                        .unwrap_or(0.0),
+                    mean_extra_transfers: extra_transfer_sum as f32
+                        / extra_transfer_count.max(1) as f32,
+                    stations_losing_all_service_share,
+                    query_count: baseline.queries.len() as u32,
+                    policy_fingerprint: policy_fingerprint.clone(),
                 }
-            }
-            delay_values.sort_by(f32::total_cmp);
-            let p95_index = if delay_values.is_empty() {
-                0
-            } else {
-                ((delay_values.len() as f32 * 0.95).ceil() as usize)
-                    .saturating_sub(1)
-                    .min(delay_values.len() - 1)
-            };
-            let delay_sum: f32 = delay_values.iter().sum();
-            let unreachable_share = unreachable as f32 / baseline_reachable.max(1) as f32;
-            LineImpactLabel {
-                snapshot: snapshot.clone(),
-                line: line_index,
-                accessibility_auc_loss: (auc_loss / baselines.len().max(1) as f64) as f32,
-                unreachable_share,
-                mean_delay_reachable_seconds: delay_sum / delay_values.len().max(1) as f32,
-                p95_delay_reachable_seconds: delay_values.get(p95_index).copied().unwrap_or(0.0),
-                mean_extra_transfers: extra_transfer_sum as f32
-                    / extra_transfer_count.max(1) as f32,
-                stations_losing_all_service_share,
-                query_count: baselines.len() as u32,
-                policy_fingerprint: policy_fingerprint.clone(),
-            }
-        })
+            },
+        )
         .collect()
 }
 
@@ -455,8 +621,20 @@ pub fn save_label_manifest(
     config: &LabelGenerationConfig,
     origin_count: usize,
 ) -> Result<()> {
-    let mut manifest_path = path.to_path_buf();
-    manifest_path.set_extension("manifest.json");
+    save_label_manifest_with_metadata(path, config, origin_count, "", &[])
+}
+
+/// Save a label manifest with the immutable inputs that make a label batch
+/// reusable. The three-argument function above remains as a compatibility
+/// wrapper for older callers and fixtures.
+pub fn save_label_manifest_with_metadata(
+    path: &Path,
+    config: &LabelGenerationConfig,
+    origin_count: usize,
+    snapshot_id: impl Into<String>,
+    departure_times_seconds: &[u32],
+) -> Result<()> {
+    let manifest_path = label_manifest_path(path);
     if let Some(parent) = manifest_path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
@@ -465,9 +643,231 @@ pub fn save_label_manifest(
         policy_fingerprint: label_policy_fingerprint(config),
         config: config.clone(),
         origin_count,
+        snapshot_id: snapshot_id.into(),
+        departure_times_seconds: departure_times_seconds.to_vec(),
     };
     fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)
         .with_context(|| format!("writing {}", manifest_path.display()))?;
+    Ok(())
+}
+
+fn label_manifest_path(path: &Path) -> std::path::PathBuf {
+    let mut manifest_path = path.to_path_buf();
+    manifest_path.set_extension("manifest.json");
+    manifest_path
+}
+
+fn label_batch_manifest_path(path: &Path) -> std::path::PathBuf {
+    let mut manifest_path = path.to_path_buf();
+    manifest_path.set_extension("batch.json");
+    manifest_path
+}
+
+pub fn save_label_batch_manifest(path: &Path, manifest: &LabelBatchManifest) -> Result<()> {
+    if manifest.schema_version != LABEL_BATCH_SCHEMA_VERSION {
+        anyhow::bail!("unsupported label batch schema {}", manifest.schema_version);
+    }
+    if manifest.snapshot_id.trim().is_empty()
+        || manifest.baseline_fingerprint.trim().is_empty()
+        || manifest.line_count == 0
+    {
+        anyhow::bail!("label batch manifest is missing required identity fields");
+    }
+    if manifest
+        .completed_lines
+        .iter()
+        .any(|line| line.0 as usize >= manifest.line_count)
+    {
+        anyhow::bail!("label batch contains an out-of-range completed line");
+    }
+    let manifest_path = label_batch_manifest_path(path);
+    if let Some(parent) = manifest_path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let temporary = manifest_path.with_extension(format!("manifest.tmp-{}", std::process::id()));
+    let encoded = serde_json::to_vec_pretty(manifest).context("encoding label batch manifest")?;
+    {
+        let mut file = File::create(&temporary)
+            .with_context(|| format!("creating {}", temporary.display()))?;
+        file.write_all(&encoded)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+    }
+    fs::rename(&temporary, &manifest_path).with_context(|| {
+        format!(
+            "committing label batch manifest {}",
+            manifest_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+pub fn load_label_batch_manifest(path: &Path) -> Result<LabelBatchManifest> {
+    let manifest_path = label_batch_manifest_path(path);
+    let bytes = fs::read(&manifest_path)
+        .with_context(|| format!("reading label batch manifest {}", manifest_path.display()))?;
+    let manifest: LabelBatchManifest = serde_json::from_slice(&bytes)
+        .with_context(|| format!("decoding label batch manifest {}", manifest_path.display()))?;
+    if manifest.schema_version != LABEL_BATCH_SCHEMA_VERSION {
+        anyhow::bail!(
+            "unsupported label batch schema {}; expected {}",
+            manifest.schema_version,
+            LABEL_BATCH_SCHEMA_VERSION
+        );
+    }
+    Ok(manifest)
+}
+
+/// Generate a counterfactual batch incrementally. Existing rows and the
+/// committed cursor are validated before work starts, and each new row is
+/// flushed before its cursor is atomically committed.
+pub fn generate_line_removal_labels_resumable(
+    router: &Router,
+    snapshot: impl Into<String>,
+    config: &LabelGenerationConfig,
+    selected_lines: &[LineIndex],
+    baseline: &RoutingBaseline,
+    output: &Path,
+) -> Result<Vec<LineImpactLabel>> {
+    let snapshot = snapshot.into();
+    baseline.validate(router)?;
+    if baseline.snapshot_id != snapshot {
+        anyhow::bail!("routing baseline snapshot does not match label snapshot");
+    }
+    let mut lines = selected_lines
+        .iter()
+        .copied()
+        .filter(|line| (line.0 as usize) < router.data.line_count)
+        .collect::<Vec<_>>();
+    lines.sort_unstable();
+    lines.dedup();
+    if lines.is_empty() {
+        return Ok(Vec::new());
+    }
+    let policy_fingerprint = label_policy_fingerprint(config);
+    let baseline_fingerprint = baseline.fingerprint.clone();
+    let manifest_exists = label_batch_manifest_path(output).exists();
+    let mut manifest = if manifest_exists {
+        load_label_batch_manifest(output)?
+    } else {
+        new_label_batch_manifest(snapshot.clone(), config, baseline, router.data.line_count)
+    };
+    if manifest.snapshot_id != snapshot
+        || manifest.policy_fingerprint != policy_fingerprint
+        || manifest.baseline_fingerprint != baseline_fingerprint
+        || manifest.origins != baseline.origins
+        || manifest.departure_times_seconds != baseline.departures
+        || manifest.router_config.maximum_transfers != router.config.maximum_transfers
+        || manifest.router_config.maximum_journey_seconds != router.config.maximum_journey_seconds
+        || manifest.line_count != router.data.line_count
+    {
+        anyhow::bail!("existing label batch is incompatible with requested inputs");
+    }
+    let mut rows = if output.exists() {
+        load_jsonl(output)
+            .with_context(|| format!("loading partial labels {}", output.display()))?
+    } else {
+        Vec::new()
+    };
+    validate_partial_labels(
+        &rows,
+        &snapshot,
+        &policy_fingerprint,
+        router.data.line_count,
+    )?;
+    let mut completed = rows
+        .iter()
+        .map(|label| label.line)
+        .collect::<std::collections::BTreeSet<_>>();
+    for line in &manifest.completed_lines {
+        if !completed.contains(line) {
+            anyhow::bail!("label batch manifest claims missing line {}", line.0);
+        }
+    }
+    manifest.completed_lines = completed.iter().copied().collect();
+    manifest.status = if lines.iter().all(|line| completed.contains(line)) {
+        "committed".into()
+    } else {
+        "in-progress".into()
+    };
+    save_label_batch_manifest(output, &manifest)?;
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(output)
+        .with_context(|| format!("opening label output {}", output.display()))?;
+    for line in lines.iter().copied() {
+        if completed.contains(&line) {
+            continue;
+        }
+        let Some(label) = generate_selected_line_removal_labels_from_baseline(
+            router,
+            snapshot.clone(),
+            config,
+            &[line],
+            baseline,
+        )
+        .into_iter()
+        .next() else {
+            continue;
+        };
+        serde_json::to_writer(&mut file, &label).context("encoding resumed line label")?;
+        file.write_all(b"\n")?;
+        file.sync_data()?;
+        rows.push(label);
+        completed.insert(line);
+        manifest.completed_lines = completed.iter().copied().collect();
+        manifest.status = if lines.iter().all(|candidate| completed.contains(candidate)) {
+            "committed".into()
+        } else {
+            "in-progress".into()
+        };
+        save_label_batch_manifest(output, &manifest)?;
+    }
+    rows.sort_by_key(|label| label.line);
+    Ok(rows)
+}
+
+fn new_label_batch_manifest(
+    snapshot: String,
+    config: &LabelGenerationConfig,
+    baseline: &RoutingBaseline,
+    line_count: usize,
+) -> LabelBatchManifest {
+    LabelBatchManifest {
+        schema_version: LABEL_BATCH_SCHEMA_VERSION.into(),
+        snapshot_id: snapshot,
+        policy_fingerprint: label_policy_fingerprint(config),
+        config: config.clone(),
+        origins: baseline.origins.clone(),
+        departure_times_seconds: baseline.departures.clone(),
+        router_config: baseline.router_config.clone(),
+        baseline_fingerprint: baseline.fingerprint.clone(),
+        line_count,
+        completed_lines: Vec::new(),
+        status: "in-progress".into(),
+    }
+}
+
+fn validate_partial_labels(
+    rows: &[LineImpactLabel],
+    snapshot: &str,
+    policy_fingerprint: &str,
+    line_count: usize,
+) -> Result<()> {
+    let mut seen = std::collections::BTreeSet::new();
+    for row in rows {
+        if row.snapshot != snapshot {
+            anyhow::bail!("partial label output contains a different snapshot");
+        }
+        if !row.policy_fingerprint.is_empty() && row.policy_fingerprint != policy_fingerprint {
+            anyhow::bail!("partial label output contains a different label policy");
+        }
+        if row.line.0 as usize >= line_count || !seen.insert(row.line) {
+            anyhow::bail!("partial label output contains a duplicate or invalid line");
+        }
+    }
     Ok(())
 }
 

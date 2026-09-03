@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use transit_domain::{
     CanonicalLine, CanonicalPattern, CanonicalStation, CanonicalTransfer, CanonicalTransitEdge,
     CanonicalTrip, CompiledNetwork, LineIndex, LineInterchange, NetworkSnapshotDescriptor,
@@ -21,6 +21,425 @@ use transit_spatial::{
 };
 
 pub const COMPILER_VERSION: &str = "transit-lab-compiler-v1";
+
+/// Reproducible city/network scope applied before compilation. The optional
+/// GeoJSON boundary is intentionally parsed here instead of introducing a
+/// heavyweight GIS dependency: GTFS stops are points and a deterministic
+/// point-in-polygon test is sufficient for the compiler boundary.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ScopeDefinition {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub boundary: Option<String>,
+    #[serde(default)]
+    pub buffer_km: f32,
+    #[serde(default)]
+    pub modes: Vec<String>,
+    #[serde(default = "default_minimum_stops_inside")]
+    pub minimum_stops_inside: usize,
+    #[serde(skip)]
+    polygons: Vec<Vec<Vec<(f64, f64)>>>,
+    #[serde(skip)]
+    boundary_bytes: Vec<u8>,
+}
+
+fn default_minimum_stops_inside() -> usize {
+    2
+}
+
+impl Default for ScopeDefinition {
+    fn default() -> Self {
+        Self {
+            name: "unscoped".into(),
+            description: String::new(),
+            boundary: None,
+            buffer_km: 0.0,
+            modes: Vec::new(),
+            minimum_stops_inside: default_minimum_stops_inside(),
+            polygons: Vec::new(),
+            boundary_bytes: Vec::new(),
+        }
+    }
+}
+
+impl ScopeDefinition {
+    pub fn from_path(path: &Path) -> Result<Self> {
+        let bytes = fs::read(path).with_context(|| format!("reading scope {}", path.display()))?;
+        let mut definition: Self = if matches!(
+            path.extension().and_then(|extension| extension.to_str()),
+            Some("yaml") | Some("yml")
+        ) {
+            serde_yaml::from_slice(&bytes).context("decoding scope YAML")?
+        } else {
+            serde_json::from_slice(&bytes).context("decoding scope JSON")?
+        };
+        if definition.name.trim().is_empty() {
+            definition.name = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or("scope")
+                .to_owned();
+        }
+        if definition.buffer_km.is_sign_negative() || !definition.buffer_km.is_finite() {
+            bail!("scope buffer_km must be finite and non-negative");
+        }
+        if definition.minimum_stops_inside == 0 {
+            definition.minimum_stops_inside = 1;
+        }
+        definition.modes = definition
+            .modes
+            .iter()
+            .map(|mode| normalize_scope_mode(mode))
+            .filter(|mode| !mode.is_empty())
+            .collect();
+        if let Some(boundary) = definition.boundary.clone() {
+            let boundary_path = if Path::new(&boundary).is_absolute() {
+                PathBuf::from(boundary)
+            } else {
+                path.parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join(boundary)
+            };
+            definition.boundary_bytes = fs::read(&boundary_path)
+                .with_context(|| format!("reading scope boundary {}", boundary_path.display()))?;
+            definition.polygons = parse_geojson_polygons(&definition.boundary_bytes)?;
+            if definition.polygons.is_empty() {
+                bail!(
+                    "scope boundary {} contains no Polygon geometry",
+                    boundary_path.display()
+                );
+            }
+        }
+        Ok(definition)
+    }
+
+    pub fn fingerprint(&self) -> [u8; 32] {
+        let config = serde_json::json!({
+            "name": self.name,
+            "description": self.description,
+            "boundary": self.boundary,
+            "buffer_km": self.buffer_km,
+            "modes": self.modes,
+            "minimum_stops_inside": self.minimum_stops_inside,
+            "boundary_sha256": Sha256::digest(&self.boundary_bytes).to_vec()
+        });
+        let digest =
+            Sha256::digest(serde_json::to_vec(&config).expect("scope definition is serializable"));
+        let mut output = [0_u8; 32];
+        output.copy_from_slice(&digest);
+        output
+    }
+
+    pub fn display_name(&self) -> String {
+        if self.buffer_km > 0.0 {
+            format!("{} (+{} km buffer)", self.name, self.buffer_km)
+        } else {
+            self.name.clone()
+        }
+    }
+
+    /// Filter routes, trips, stop times, and transfer references while keeping
+    /// the source hash intact. The scope fingerprint in CompileOptions makes
+    /// the resulting snapshot distinct from the unscoped feed.
+    pub fn apply(&self, feed: &GtfsFeed) -> Result<GtfsFeed> {
+        let route_ids: BTreeSet<String> = feed
+            .routes
+            .iter()
+            .filter(|route| {
+                self.modes.is_empty()
+                    || self
+                        .modes
+                        .iter()
+                        .any(|mode| mode_matches(route.route_type.as_deref(), mode))
+            })
+            .map(|route| route.route_id.clone())
+            .collect();
+        let stops = feed
+            .stops
+            .iter()
+            .map(|stop| (stop.stop_id.as_str(), stop))
+            .collect::<HashMap<_, _>>();
+        let mut kept_trip_ids = BTreeSet::new();
+        let mut kept_stop_ids = BTreeSet::new();
+        let mut stop_times = Vec::new();
+        let mut rows_by_trip = HashMap::<&str, Vec<&gtfs_ingest::StopTimeRecord>>::new();
+        for row in &feed.stop_times {
+            rows_by_trip
+                .entry(row.trip_id.as_str())
+                .or_default()
+                .push(row);
+        }
+        for trip in &feed.trips {
+            if !route_ids.contains(&trip.route_id) {
+                continue;
+            }
+            let rows = rows_by_trip
+                .get(trip.trip_id.as_str())
+                .cloned()
+                .unwrap_or_default();
+            let inside_count = rows
+                .iter()
+                .filter(|row| {
+                    stops
+                        .get(row.stop_id.as_str())
+                        .is_some_and(|stop| self.contains_stop(stop))
+                })
+                .count();
+            if inside_count < self.minimum_stops_inside {
+                continue;
+            }
+            kept_trip_ids.insert(trip.trip_id.clone());
+            // A regional feed can contain a qualifying route whose trip runs
+            // well outside the requested city. Keep only the stop-time rows
+            // in the boundary/buffer. Parent stations are added below so
+            // canonical station construction still has the hierarchy it
+            // needs, without letting out-of-scope platforms leak into the
+            // compiled network.
+            for row in rows.into_iter().filter(|row| {
+                stops
+                    .get(row.stop_id.as_str())
+                    .is_some_and(|stop| self.contains_stop(stop))
+            }) {
+                kept_stop_ids.insert(row.stop_id.clone());
+                stop_times.push(row.clone());
+            }
+        }
+        // Preserve parent station rows needed by canonical station merging.
+        let mut parent = true;
+        while parent {
+            parent = false;
+            for stop_id in kept_stop_ids.clone() {
+                if let Some(value) = stops
+                    .get(stop_id.as_str())
+                    .and_then(|stop| stop.parent_station.as_deref())
+                {
+                    parent = kept_stop_ids.insert(value.to_owned()) || parent;
+                }
+            }
+        }
+        let trips = feed
+            .trips
+            .iter()
+            .filter(|trip| kept_trip_ids.contains(&trip.trip_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let routes = feed
+            .routes
+            .iter()
+            .filter(|route| {
+                route_ids.contains(&route.route_id)
+                    && trips.iter().any(|trip| trip.route_id == route.route_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let stops = feed
+            .stops
+            .iter()
+            .filter(|stop| kept_stop_ids.contains(&stop.stop_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let service_ids = trips
+            .iter()
+            .map(|trip| trip.service_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let calendars = feed
+            .calendars
+            .iter()
+            .filter(|calendar| service_ids.contains(calendar.service_id.as_str()))
+            .cloned()
+            .collect();
+        let calendar_dates = feed
+            .calendar_dates
+            .iter()
+            .filter(|date| service_ids.contains(date.service_id.as_str()))
+            .cloned()
+            .collect();
+        let transfers = feed
+            .transfers
+            .iter()
+            .filter(|edge| {
+                kept_stop_ids.contains(&edge.from_stop_id)
+                    && kept_stop_ids.contains(&edge.to_stop_id)
+            })
+            .cloned()
+            .collect();
+        let pathways = feed
+            .pathways
+            .iter()
+            .filter(|edge| {
+                kept_stop_ids.contains(&edge.from_stop_id)
+                    && kept_stop_ids.contains(&edge.to_stop_id)
+            })
+            .cloned()
+            .collect();
+        if trips.is_empty() {
+            bail!("scope {} selected no trips", self.name);
+        }
+        let mut scoped = feed.clone();
+        scoped.routes = routes;
+        scoped.trips = trips;
+        scoped.stops = stops;
+        scoped.stop_times = stop_times;
+        scoped.calendars = calendars;
+        scoped.calendar_dates = calendar_dates;
+        scoped.transfers = transfers;
+        scoped.pathways = pathways;
+        Ok(scoped)
+    }
+
+    fn contains_stop(&self, stop: &gtfs_ingest::StopRecord) -> bool {
+        let (Some(latitude), Some(longitude)) = (
+            stop.stop_lat
+                .as_deref()
+                .and_then(|value| value.parse::<f64>().ok()),
+            stop.stop_lon
+                .as_deref()
+                .and_then(|value| value.parse::<f64>().ok()),
+        ) else {
+            return false;
+        };
+        if self.polygons.is_empty() {
+            return true;
+        }
+        let buffer_lat = f64::from(self.buffer_km) / 111.0;
+        let buffer_lon = buffer_lat / latitude.to_radians().cos().abs().max(0.1);
+        self.polygons.iter().any(|polygon| {
+            let inside = point_in_ring(
+                longitude,
+                latitude,
+                polygon.first().map(Vec::as_slice).unwrap_or(&[]),
+            );
+            let inside_hole = polygon
+                .iter()
+                .skip(1)
+                .any(|ring| point_in_ring(longitude, latitude, ring));
+            if inside && !inside_hole {
+                return true;
+            }
+            self.buffer_km > 0.0
+                && polygon
+                    .iter()
+                    .any(|ring| point_near_ring(longitude, latitude, ring, buffer_lon, buffer_lat))
+        })
+    }
+}
+
+fn normalize_scope_mode(value: &str) -> String {
+    value.trim().to_ascii_lowercase().replace(['-', ' '], "_")
+}
+
+fn mode_matches(route_type: Option<&str>, wanted: &str) -> bool {
+    let mode = match route_type
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(3)
+    {
+        0 | 5 | 6 | 7 => "tram",
+        1 => "subway",
+        2 | 12 => "suburban_rail",
+        3 => "bus",
+        4 => "ferry",
+        11 => "trolleybus",
+        _ => "other",
+    };
+    mode == wanted || (wanted == "rail" && mode == "suburban_rail")
+}
+
+fn parse_geojson_polygons(bytes: &[u8]) -> Result<Vec<Vec<Vec<(f64, f64)>>>> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).context("decoding scope GeoJSON")?;
+    let mut output = Vec::new();
+    collect_geojson_polygons(&value, &mut output)?;
+    Ok(output)
+}
+
+fn collect_geojson_polygons(
+    value: &serde_json::Value,
+    output: &mut Vec<Vec<Vec<(f64, f64)>>>,
+) -> Result<()> {
+    match value.get("type").and_then(serde_json::Value::as_str) {
+        Some("FeatureCollection") => {
+            for feature in value
+                .get("features")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                collect_geojson_polygons(feature, output)?;
+            }
+        }
+        Some("Feature") => {
+            if let Some(geometry) = value.get("geometry") {
+                collect_geojson_polygons(geometry, output)?;
+            }
+        }
+        Some("Polygon") => {
+            let rings = value
+                .get("coordinates")
+                .and_then(serde_json::Value::as_array)
+                .context("GeoJSON Polygon has no coordinates")?;
+            let mut polygon = Vec::new();
+            for ring in rings {
+                let points = ring
+                    .as_array()
+                    .context("GeoJSON ring is not an array")?
+                    .iter()
+                    .map(|point| {
+                        let pair = point.as_array().context("GeoJSON point is not an array")?;
+                        Ok((
+                            pair.first()
+                                .and_then(serde_json::Value::as_f64)
+                                .context("GeoJSON longitude missing")?,
+                            pair.get(1)
+                                .and_then(serde_json::Value::as_f64)
+                                .context("GeoJSON latitude missing")?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                if points.len() >= 3 {
+                    polygon.push(points);
+                }
+            }
+            if !polygon.is_empty() {
+                output.push(polygon);
+            }
+        }
+        Some("MultiPolygon") => {
+            let polygons = value
+                .get("coordinates")
+                .and_then(serde_json::Value::as_array)
+                .context("GeoJSON MultiPolygon has no coordinates")?;
+            for coordinates in polygons {
+                collect_geojson_polygons(
+                    &serde_json::json!({"type": "Polygon", "coordinates": coordinates}),
+                    output,
+                )?;
+            }
+        }
+        Some(other) => bail!("unsupported GeoJSON geometry type {other}"),
+        None => bail!("GeoJSON object has no type"),
+    }
+    Ok(())
+}
+
+fn point_in_ring(x: f64, y: f64, ring: &[(f64, f64)]) -> bool {
+    let mut inside = false;
+    for index in 0..ring.len() {
+        let (x1, y1) = ring[index];
+        let (x2, y2) = ring[(index + 1) % ring.len()];
+        if ((y1 > y) != (y2 > y)) && x < (x2 - x1) * (y - y1) / (y2 - y1) + x1 {
+            inside = !inside;
+        }
+    }
+    inside
+}
+
+fn point_near_ring(x: f64, y: f64, ring: &[(f64, f64)], max_x: f64, max_y: f64) -> bool {
+    ring.iter()
+        .any(|(px, py)| (x - px).abs() <= max_x && (y - py).abs() <= max_y)
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LineGroupingPolicy {
@@ -224,6 +643,12 @@ impl CompileOptions {
     pub fn with_scope(mut self, scope: impl Into<String>) -> Self {
         self.geographical_scope = scope.into();
         self.scope_hash = hash_scope(&self.geographical_scope);
+        self
+    }
+
+    pub fn with_scope_definition(mut self, scope: &ScopeDefinition) -> Self {
+        self.geographical_scope = scope.display_name();
+        self.scope_hash = scope.fingerprint();
         self
     }
 
@@ -1525,5 +1950,87 @@ mod tests {
             ..TripRecord::default()
         };
         assert_eq!(policy.key_for_trip(&route, &trip), "manual:X1");
+    }
+
+    #[test]
+    fn scope_trims_regional_trips_and_keeps_parent_stations() {
+        let mut feed = fixture();
+        feed.routes.push(RouteRecord {
+            route_id: "regional".into(),
+            route_short_name: Some("Regional".into()),
+            route_type: Some("2".into()),
+            ..RouteRecord::default()
+        });
+        feed.trips.push(TripRecord {
+            route_id: "regional".into(),
+            service_id: "weekday".into(),
+            trip_id: "regional-trip".into(),
+            ..TripRecord::default()
+        });
+        for (sequence, stop_id) in [
+            "platform_a1",
+            "platform_b",
+            "platform_c",
+            "platform_d",
+            "platform_e",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            feed.stop_times.push(StopTimeRecord {
+                trip_id: "regional-trip".into(),
+                arrival_time: format!("08:{:02}:00", sequence * 5),
+                departure_time: format!("08:{:02}:00", sequence * 5),
+                stop_id: stop_id.into(),
+                stop_sequence: sequence.to_string(),
+                ..StopTimeRecord::default()
+            });
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let boundary = directory.path().join("city.geojson");
+        std::fs::write(
+            &boundary,
+            serde_json::json!({
+                "type": "Polygon",
+                "coordinates": [[[16.099, 48.099], [16.1025, 48.099], [16.1025, 48.1025], [16.099, 48.1025], [16.099, 48.099]]]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let scope_path = directory.path().join("scope.json");
+        std::fs::write(
+            &scope_path,
+            serde_json::json!({
+                "name": "city",
+                "boundary": "city.geojson",
+                "minimum_stops_inside": 2
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let scope = ScopeDefinition::from_path(&scope_path).unwrap();
+        let scoped = scope.apply(&feed).unwrap();
+
+        assert!(scoped
+            .trips
+            .iter()
+            .any(|trip| trip.trip_id == "regional-trip"));
+        assert!(!scoped.trips.iter().any(|trip| trip.route_id == "red"));
+        assert!(scoped.stop_times.iter().all(|row| {
+            ["platform_a1", "platform_a2", "platform_b", "platform_c"]
+                .contains(&row.stop_id.as_str())
+        }));
+        assert_eq!(
+            scoped
+                .stop_times
+                .iter()
+                .filter(|row| row.trip_id == "regional-trip")
+                .count(),
+            3
+        );
+        assert!(scoped.stops.iter().any(|stop| stop.stop_id == "station_a"));
+        assert!(!scoped.stops.iter().any(|stop| stop.stop_id == "station_d"));
+        assert!(!scoped.stops.iter().any(|stop| stop.stop_id == "station_e"));
     }
 }

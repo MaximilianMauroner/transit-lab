@@ -13,3 +13,8 @@ serde_json.workspace = true
 transit-domain = { path = "../transit-domain" }
 transit-graph = { path = "../transit-graph" }
 transit-labels = { path = "../transit-labels" }
+
+[dev-dependencies]
+gtfs-compile = { path = "../gtfs-compile" }
+gtfs-ingest = { path = "../gtfs-ingest" }
+tempfile.workspace = true

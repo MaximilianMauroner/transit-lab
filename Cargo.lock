@@ -1997,6 +1997,7 @@ dependencies = [
  "gtfs-compile",
  "gtfs-ingest",
  "gtfs-source",
+ "serde",
  "serde_json",
  "transit-dataset",
  "transit-domain",
@@ -2015,8 +2016,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "gtfs-compile",
+ "gtfs-ingest",
  "serde",
  "serde_json",
+ "tempfile",
  "transit-domain",
  "transit-graph",
  "transit-labels",
@@ -2095,6 +2099,8 @@ name = "transit-router"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "rayon",
+ "serde",
  "transit-domain",
 ]
 
@@ -2134,10 +2140,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "gtfs-compile",
+ "gtfs-ingest",
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "tch",
+ "tempfile",
  "transit-domain",
  "transit-graph",
  "transit-labels",

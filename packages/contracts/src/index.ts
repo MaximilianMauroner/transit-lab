@@ -7,12 +7,16 @@
  * command, and event payloads remain replayable by SSE clients.
  */
 
-export const RUN_EVENT_SCHEMA_VERSION = 1;
+export const RUN_EVENT_SCHEMA_VERSION = 2;
+export const TRAINING_CHECKPOINT_SCHEMA_VERSION = 1;
+export const TRAINING_CONTROL_SCHEMA_VERSION = 1;
 export const ARTIFACT_MANIFEST_SCHEMA_VERSION = 1;
 export const DATASET_MANIFEST_SCHEMA_VERSION = 1;
+export const EVALUATION_RESULT_SCHEMA_VERSION = 1;
 export const INFERENCE_RESULT_SCHEMA_VERSION = 1;
 export const EXPERIMENT_SPEC_SCHEMA_VERSION = 1;
 export const PUBLICATION_MANIFEST_SCHEMA_VERSION = 1;
+export const BENCHMARK_RESULT_SCHEMA_VERSION = 1;
 export const DEFAULT_MODEL_CONFIG = "configs/models/multitask-v1.yaml";
 
 export const RUNTIME_CONFIG_DEFAULTS = Object.freeze({
@@ -23,15 +27,45 @@ export const RUNTIME_CONFIG_DEFAULTS = Object.freeze({
   workerThreads: 1
 });
 
+export const RUN_DESIRED_STATES = Object.freeze(["running", "paused", "cancelled"]);
+export const RUN_OBSERVED_STATES = Object.freeze([
+  "queued",
+  "starting",
+  "claimed",
+  "running",
+  "checkpointing",
+  "paused",
+  "succeeded",
+  "failed",
+  "cancelled",
+  "interrupted",
+  "orphaned"
+]);
+
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
 export type ConfigValue = string | Record<string, JsonValue>;
 export type RuntimeConfig = {
   device: string;
   precision: "fp32" | "fp16" | "bf16";
+  backend?: "reference" | "libtorch";
   checkpointInterval: number;
   metricInterval: number;
   workerThreads: number;
+  checkpointEverySteps?: number;
+  checkpointEverySeconds?: number;
+  maxAttemptSeconds?: number;
+  checkpointGraceSeconds?: number;
+  gradientAccumulation?: number;
+  rayonThreads?: number;
+  allowedWindows?: TrainingWindow[];
+};
+
+export type TrainingWindow = {
+  days: string[];
+  start: string;
+  end: string;
+  timezone: string;
 };
 
 export type ExperimentSpec = {
@@ -58,7 +92,11 @@ export const RUN_STATUSES = Object.freeze([
   "succeeded",
   "failed",
   "cancelled",
-  "orphaned"
+  "orphaned",
+  "starting",
+  "checkpointing",
+  "paused",
+  "interrupted"
 ]);
 
 export const SIMILARITY_FACETS = Object.freeze([
@@ -119,7 +157,8 @@ function assertSha256(value, field) {
 
 function validateRelativePath(value, field) {
   requiredString(value, field);
-  if (value.startsWith("/") || value.split(/[\\/]+/).includes("..")) {
+  const segments = value.split(/[\\/]+/);
+  if (/^(?:[\\/]|[A-Za-z]:)/.test(value) || segments.some((segment) => segment === "" || segment === "." || segment === "..")) {
     throw new Error(`${field} must be a relative path`);
   }
   return value;
@@ -168,13 +207,58 @@ function validateRuntimeConfig(value): RuntimeConfig {
     }
     return candidate;
   };
-  return {
+  const runtime: RuntimeConfig = {
     device,
     precision,
     checkpointInterval: positiveInteger(input.checkpointInterval, "runtime.checkpointInterval", RUNTIME_CONFIG_DEFAULTS.checkpointInterval),
     metricInterval: positiveInteger(input.metricInterval, "runtime.metricInterval", RUNTIME_CONFIG_DEFAULTS.metricInterval),
     workerThreads: positiveInteger(input.workerThreads, "runtime.workerThreads", RUNTIME_CONFIG_DEFAULTS.workerThreads)
   };
+  if (input.backend !== undefined) {
+    if (input.backend !== "reference" && input.backend !== "libtorch") {
+      throw new Error("runtime.backend must be reference or libtorch");
+    }
+    runtime.backend = input.backend;
+  }
+  const optionalPositive = [
+    ["checkpointEverySteps", "runtime.checkpointEverySteps"],
+    ["checkpointEverySeconds", "runtime.checkpointEverySeconds"],
+    ["maxAttemptSeconds", "runtime.maxAttemptSeconds"],
+    ["checkpointGraceSeconds", "runtime.checkpointGraceSeconds"],
+    ["gradientAccumulation", "runtime.gradientAccumulation"],
+    ["rayonThreads", "runtime.rayonThreads"]
+  ];
+  for (const [key, field] of optionalPositive) {
+    if (input[key] !== undefined) runtime[key] = positiveInteger(input[key], field, 1);
+  }
+  if (input.allowedWindows !== undefined) {
+    if (!Array.isArray(input.allowedWindows) || input.allowedWindows.length > 31) {
+      throw new Error("runtime.allowedWindows must contain at most 31 windows");
+    }
+    const timePattern = /^([01]\d|2[0-3]):[0-5]\d$/;
+    const dayNames = new Set(["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]);
+    runtime.allowedWindows = input.allowedWindows.map((window, index) => {
+      if (!window || typeof window !== "object" || Array.isArray(window)) {
+        throw new Error(`runtime.allowedWindows[${index}] must be an object`);
+      }
+      if (!Array.isArray(window.days) || window.days.length === 0 ||
+          window.days.some((day) => typeof day !== "string" || !dayNames.has(day.toLowerCase()))) {
+        throw new Error(`runtime.allowedWindows[${index}].days is invalid`);
+      }
+      if (typeof window.start !== "string" || !timePattern.test(window.start) ||
+          typeof window.end !== "string" || !timePattern.test(window.end)) {
+        throw new Error(`runtime.allowedWindows[${index}] times must use HH:MM`);
+      }
+      const timezone = requiredString(window.timezone, `runtime.allowedWindows[${index}].timezone`);
+      return {
+        days: [...new Set(window.days.map((day) => day.toLowerCase()))],
+        start: window.start,
+        end: window.end,
+        timezone
+      };
+    });
+  }
+  return runtime;
 }
 
 /** Validate and normalize a browser-submitted known run specification. */
@@ -238,12 +322,15 @@ export function validateRunSpec(input) {
         runtime: validateRuntimeConfig(input.runtime)
       };
     }
-    case "evaluate":
+    case "evaluate": {
+      const datasetId = optionalSafeId(input.datasetId, "datasetId");
       return {
         kind,
         modelId: assertSafeId(requiredString(input.modelId, "modelId"), "modelId"),
+        ...(datasetId ? { datasetId } : {}),
         evaluationSuite: validateConfigValue(input.evaluationSuite, "evaluationSuite") ?? "default"
       };
+    }
     case "infer":
       return {
         kind,
@@ -299,13 +386,15 @@ function validateEventBase(event) {
   if (!event || typeof event !== "object" || Array.isArray(event)) {
     throw new Error("run event must be an object");
   }
-  if (event.schemaVersion !== RUN_EVENT_SCHEMA_VERSION) {
+  if (![1, RUN_EVENT_SCHEMA_VERSION].includes(event.schemaVersion)) {
     throw new Error(`unsupported run event schema version: ${event.schemaVersion}`);
   }
   nonNegativeInteger(event.seq, "seq");
   assertSafeId(requiredString(event.runId, "runId"), "runId");
   requiredString(event.timestamp, "timestamp");
   requiredString(event.type, "type");
+  if (event.attemptId !== undefined) assertSafeId(requiredString(event.attemptId, "attemptId"), "attemptId");
+  if (event.attemptSeq !== undefined) nonNegativeInteger(event.attemptSeq, "attemptSeq");
 }
 
 /** Validate the structured JSONL/SSE event protocol. */
@@ -321,6 +410,18 @@ export function validateRunEvent(event) {
         requiredString(event.code, "code");
         requiredString(event.message, "message");
       }
+      break;
+    case "run.paused":
+    case "run.resumed":
+    case "run.time-sliced":
+    case "run.recovered":
+    case "attempt.started":
+    case "attempt.ended":
+    case "pause.requested":
+      if (event.attemptId !== undefined) assertSafeId(requiredString(event.attemptId, "attemptId"), "attemptId");
+      if (event.reason !== undefined) requiredString(event.reason, "reason");
+      if (event.path !== undefined) requiredString(event.path, "path");
+      if (event.exitCode !== undefined) finiteNumber(event.exitCode, "exitCode");
       break;
     case "step.started":
     case "step.completed":
@@ -365,6 +466,21 @@ export function validateRunEvent(event) {
       if (event.epoch !== undefined) nonNegativeInteger(event.epoch, "epoch");
       if (event.step !== undefined) nonNegativeInteger(event.step, "step");
       break;
+    case "checkpoint.started":
+      requiredString(event.phase, "phase");
+      nonNegativeInteger(event.step, "step");
+      break;
+    case "checkpoint.committed":
+      requiredString(event.phase, "phase");
+      nonNegativeInteger(event.step, "step");
+      requiredString(event.path, "path");
+      break;
+    case "checkpoint.failed":
+      requiredString(event.phase, "phase");
+      nonNegativeInteger(event.step, "step");
+      requiredString(event.code, "code");
+      requiredString(event.message, "message");
+      break;
     case "heartbeat":
       requiredString(event.phase, "phase");
       nonNegativeInteger(event.step, "step");
@@ -384,6 +500,78 @@ export function validateRunEvent(event) {
       throw new Error(`unsupported run event type: ${event.type}`);
   }
   return event;
+}
+
+function checkpointSha256(value, field) {
+  assertSha256(value, field);
+}
+
+/** Match the Rust checkpoint manifest fingerprint over its ordered payload descriptors. */
+export function trainingCheckpointFingerprint(files) {
+  const ordered = files
+    .map(({ path, sha256, sizeBytes }) => ({ path, sha256, sizeBytes }))
+    .sort((left, right) => left.path < right.path ? -1 : left.path > right.path ? 1 : 0);
+  return sha256Hex(JSON.stringify(ordered));
+}
+
+/** Validate the committed directory checkpoint manifest at the worker boundary. */
+export function validateTrainingCheckpointManifest(manifest) {
+  if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) {
+    throw new Error("training checkpoint manifest must be an object");
+  }
+  if (manifest.schemaVersion !== TRAINING_CHECKPOINT_SCHEMA_VERSION) {
+    throw new Error(`unsupported training checkpoint schema: ${manifest.schemaVersion}`);
+  }
+  assertSafeId(requiredString(manifest.runId, "runId"), "runId");
+  if (manifest.attemptId !== undefined && manifest.attemptId !== null) {
+    assertSafeId(requiredString(manifest.attemptId, "attemptId"), "attemptId");
+  }
+  nonNegativeInteger(manifest.globalStep, "globalStep");
+  requiredString(manifest.phase, "phase");
+  requiredString(manifest.datasetFingerprint, "datasetFingerprint");
+  requiredString(manifest.configFingerprint, "configFingerprint");
+  requiredString(manifest.codeCommit, "codeCommit");
+  requiredString(manifest.backend, "backend");
+  requiredString(manifest.backendVersion, "backendVersion");
+  requiredString(manifest.deviceType, "deviceType");
+  if (manifest.status !== "committed") throw new Error("training checkpoint is not committed");
+  checkpointSha256(manifest.checkpointFingerprint, "checkpointFingerprint");
+  if (!Array.isArray(manifest.files) || manifest.files.length === 0) {
+    throw new Error("training checkpoint files must be a non-empty array");
+  }
+  const names = new Set();
+  for (const file of manifest.files) {
+    if (!file || typeof file !== "object" || Array.isArray(file)) throw new Error("checkpoint file must be an object");
+    const path = requiredString(file.path, "files.path");
+    if (!/^[A-Za-z0-9._-]+$/.test(path) || path === "manifest.json" || path === "." || path === ".." || names.has(path)) {
+      throw new Error("checkpoint file paths must be unique payload names");
+    }
+    names.add(path);
+    checkpointSha256(file.sha256, "files.sha256");
+    nonNegativeInteger(file.sizeBytes, "files.sizeBytes");
+  }
+  if (trainingCheckpointFingerprint(manifest.files) !== String(manifest.checkpointFingerprint).toLowerCase()) {
+    throw new Error("training checkpoint fingerprint does not match its payload descriptors");
+  }
+  return manifest;
+}
+
+export function validateTrainingControl(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("training control must be an object");
+  }
+  if (value.schemaVersion !== TRAINING_CONTROL_SCHEMA_VERSION) {
+    throw new Error(`unsupported training control schema: ${value.schemaVersion}`);
+  }
+  if (!RUN_DESIRED_STATES.includes(value.desiredState)) {
+    throw new Error(`unsupported training desired state: ${value.desiredState}`);
+  }
+  if (value.checkpointRequested !== undefined && typeof value.checkpointRequested !== "boolean") {
+    throw new Error("checkpointRequested must be boolean");
+  }
+  if (value.requestedAt !== undefined && value.requestedAt !== null) requiredString(value.requestedAt, "requestedAt");
+  if (value.reason !== undefined && value.reason !== null) requiredString(value.reason, "reason");
+  return value;
 }
 
 export function validateArtifactManifest(manifest) {
@@ -493,6 +681,129 @@ export function validateInferenceResult(result) {
       });
     }
     finiteNumber(prediction.structuralUniqueness, `predictions[${index}].structuralUniqueness`);
+  }
+  return result;
+}
+
+/** Validate the ranking report emitted by the Rust evaluation command. */
+export function validateEvaluationResult(result) {
+  if (!result || typeof result !== "object" || Array.isArray(result)) {
+    throw new Error("evaluation result must be an object");
+  }
+  if (result.schemaVersion !== EVALUATION_RESULT_SCHEMA_VERSION) {
+    throw new Error(`unsupported evaluation result schema version: ${result.schemaVersion}`);
+  }
+  assertSafeId(requiredString(result.datasetId, "datasetId"), "datasetId");
+  requiredString(result.datasetFingerprint, "datasetFingerprint");
+  if (result.modelId !== undefined && result.modelId !== null) {
+    assertSafeId(requiredString(result.modelId, "modelId"), "modelId");
+  }
+  if (result.modelPath !== undefined && result.modelPath !== null) requiredString(result.modelPath, "modelPath");
+  const split = requiredString(result.split, "split");
+  if (!["all", "train", "validation", "test"].includes(split)) {
+    throw new Error("evaluation split must be all, train, validation, or test");
+  }
+  if (!Number.isInteger(result.topK) || result.topK < 1) throw new Error("evaluation topK must be a positive integer");
+  if (!Number.isInteger(result.trainingExamples) || result.trainingExamples < 0) throw new Error("evaluation trainingExamples must be a non-negative integer");
+  if (!Number.isInteger(result.fitExamples) || result.fitExamples < 0) throw new Error("evaluation fitExamples must be a non-negative integer");
+  if (!Array.isArray(result.metrics) || result.metrics.length === 0) throw new Error("evaluation metrics must not be empty");
+  const metricNames = new Set();
+  for (const [index, metric] of result.metrics.entries()) {
+    if (!metric || typeof metric !== "object" || Array.isArray(metric)) throw new Error(`evaluation metric ${index + 1} must be an object`);
+    const baseline = requiredString(metric.baseline, `metrics[${index}].baseline`);
+    if (metricNames.has(baseline)) throw new Error(`evaluation baseline ${baseline} is duplicated`);
+    metricNames.add(baseline);
+    if (!metric.values || typeof metric.values !== "object" || Array.isArray(metric.values)) throw new Error(`metrics[${index}].values must be an object`);
+    const values = metric.values;
+    for (const name of ["examples", "snapshots"]) {
+      if (!Number.isInteger(values[name]) || values[name] < 0) throw new Error(`metrics[${index}].values.${name} must be a non-negative integer`);
+    }
+    for (const name of ["spearman", "pairwiseAccuracy", "topKOverlap"]) {
+      if (values[name] !== null && values[name] !== undefined) finiteNumber(values[name], `metrics[${index}].values.${name}`);
+    }
+    if (values.spearman !== null && values.spearman !== undefined && (values.spearman < -1 || values.spearman > 1)) {
+      throw new Error(`metrics[${index}].values.spearman must be between -1 and 1`);
+    }
+    for (const name of ["pairwiseAccuracy", "topKOverlap"]) {
+      if (values[name] !== null && values[name] !== undefined && (values[name] < 0 || values[name] > 1)) {
+        throw new Error(`metrics[${index}].values.${name} must be between 0 and 1`);
+      }
+    }
+  }
+  if (result.createdAt !== undefined && result.createdAt !== null) requiredString(result.createdAt, "createdAt");
+  return result;
+}
+
+/** Validate a measured routing or training throughput artifact. */
+export function validateBenchmarkResult(result) {
+  if (!result || typeof result !== "object" || Array.isArray(result)) {
+    throw new Error("benchmark result must be an object");
+  }
+  if (result.schemaVersion !== BENCHMARK_RESULT_SCHEMA_VERSION) {
+    throw new Error(`unsupported benchmark result schema version: ${result.schemaVersion}`);
+  }
+  const benchmark = requiredString(result.benchmark, "benchmark");
+  if (!["routing", "train-step", "threads"].includes(benchmark)) {
+    throw new Error("benchmark must be routing, train-step, or threads");
+  }
+  const workload = requiredString(result.workload, "workload");
+  if (!["routing", "train-step", "mixed"].includes(workload)) {
+    throw new Error("benchmark workload must be routing, train-step, or mixed");
+  }
+  for (const field of ["snapshotId", "graphId"]) {
+    if (result[field] !== undefined && result[field] !== null) {
+      assertSafeId(requiredString(result[field], field), field);
+    }
+  }
+  const nonNegativeInteger = (value, field) => {
+    if (!Number.isInteger(value) || value < 0) throw new Error(`${field} must be a non-negative integer`);
+  };
+  for (const field of ["warmupUnits", "measuredUnits", "estimatedWorkUnits"]) {
+    if (result[field] !== undefined && result[field] !== null) nonNegativeInteger(result[field], field);
+  }
+  for (const field of ["medianMilliseconds", "p95Milliseconds", "throughput"]) {
+    if (result[field] !== undefined && result[field] !== null) {
+      finiteNumber(result[field], field);
+      if (result[field] < 0) throw new Error(`${field} must be non-negative`);
+    }
+  }
+  if (result.peakResidentMemoryBytes !== undefined && result.peakResidentMemoryBytes !== null) {
+    nonNegativeInteger(result.peakResidentMemoryBytes, "peakResidentMemoryBytes");
+  }
+  if (result.throughputUnit !== undefined && result.throughputUnit !== null) {
+    requiredString(result.throughputUnit, "throughputUnit");
+  }
+  if (result.threadConfiguration !== undefined &&
+      (!result.threadConfiguration || typeof result.threadConfiguration !== "object" || Array.isArray(result.threadConfiguration))) {
+    throw new Error("threadConfiguration must be an object");
+  }
+  if (result.runtime !== undefined &&
+      (!result.runtime || typeof result.runtime !== "object" || Array.isArray(result.runtime))) {
+    throw new Error("benchmark runtime must be an object");
+  }
+  if (result.graphCounts !== undefined &&
+      (!result.graphCounts || typeof result.graphCounts !== "object" || Array.isArray(result.graphCounts))) {
+    throw new Error("graphCounts must be an object");
+  }
+  if (result.reports !== undefined) {
+    if (!Array.isArray(result.reports)) throw new Error("benchmark reports must be an array");
+    for (const [index, report] of result.reports.entries()) {
+      if (!report || typeof report !== "object" || Array.isArray(report)) {
+        throw new Error(`benchmark report ${index + 1} must be an object`);
+      }
+      if (report.workload !== undefined && !["routing", "train-step"].includes(report.workload)) {
+        throw new Error(`benchmark report ${index + 1} has an unsupported workload`);
+      }
+      if (report.threads !== undefined) nonNegativeInteger(report.threads, `reports[${index}].threads`);
+      if (report.throughput !== undefined) {
+        finiteNumber(report.throughput, `reports[${index}].throughput`);
+        if (report.throughput < 0) throw new Error(`reports[${index}].throughput must be non-negative`);
+      }
+    }
+  }
+  if (result.createdAt !== undefined && result.createdAt !== null) requiredString(result.createdAt, "createdAt");
+  if (result.throughput === undefined && (!Array.isArray(result.reports) || result.reports.length === 0)) {
+    throw new Error("benchmark result must contain throughput or reports");
   }
   return result;
 }

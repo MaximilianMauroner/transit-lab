@@ -6,14 +6,27 @@ node_modules/
 /data/labels/
 /data/runs/
 /data/models/
-data/*.sqlite
+/data/*.sqlite*
 /data/demo/
 /data/publications/
+
+# Ephemeral outputs created by local smoke and runtime checks.
+/data/demo-check.*/
+/data/runtime-check.*/
+
 /apps/studio/public/dist/
 /apps/explorer/public/dist/
 transit-lab-smoke.*/
 /.agents/artifacts/
 /.agents/scratch/
+
+# Local tooling and coverage output.
+.cache/
+.turbo/
+coverage/
+*.log
+*.lcov
+.DS_Store
 *.ot
 *.safetensors
 *.zip

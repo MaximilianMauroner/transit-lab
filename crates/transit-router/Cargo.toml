@@ -7,5 +7,6 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+rayon.workspace = true
+serde.workspace = true
 transit-domain = { path = "../transit-domain" }
-

@@ -14,7 +14,7 @@ export function parseEventLine(line, lineNumber, runId) {
   return event;
 }
 
-export async function readStructuredEvents(path, runId) {
+export async function readStructuredEvents(path, runId, { allowTrailingPartial = false } = {}) {
   let content;
   try {
     content = await readFile(path, "utf8");
@@ -22,5 +22,8 @@ export async function readStructuredEvents(path, runId) {
     if (error?.code === "ENOENT") return [];
     throw error;
   }
-  return content.split(/\r?\n/).map((line, index) => parseEventLine(line, index + 1, runId)).filter(Boolean);
+  const lines = content.split(/\r?\n/);
+  const endsWithNewline = /\r?\n$/.test(content);
+  if (allowTrailingPartial && !endsWithNewline) lines.pop();
+  return lines.map((line, index) => parseEventLine(line, index + 1, runId)).filter(Boolean);
 }

@@ -43,7 +43,7 @@ async function proxyApi(request) {
 export async function createStudioServer({ port = Number(process.env.STUDIO_PORT || process.env.PORT || 3000) } = {}) {
   const publicRoot = resolve(import.meta.dir, "../../public");
   const bundledClient = resolve(publicRoot, "dist/app.js");
-  if (!(await Bun.file(bundledClient).exists())) {
+  if (!(await Bun.file(bundledClient).exists()) || !(await Bun.file(resolve(publicRoot, "dist/styles.css")).exists())) {
     const result = await buildStudioClient(resolve(publicRoot, "dist"));
     if (!result.success) throw new Error(`Studio client build failed: ${result.logs.map((log) => log.message).join("\n")}`);
   }

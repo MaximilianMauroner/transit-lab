@@ -6,7 +6,9 @@ import {
   profileWeights,
   stableStringify,
   validateArtifactManifest,
+  validateBenchmarkResult,
   validateDatasetManifest,
+  validateEvaluationResult,
   validateExperimentSpec,
   validateRunEvent,
   validateRunSpec
@@ -155,4 +157,54 @@ test("versioned inference results carry named values and optional percentiles", 
   };
   expect(validateInferenceResult(result)).toEqual(result);
   expect(() => validateInferenceResult({ ...result, predictions: [{ ...result.predictions[0], metricPercentiles: [2] }] })).toThrow("between 0 and 1");
+});
+
+test("evaluation results validate ranking baselines and metric ranges", () => {
+  const result = {
+    schemaVersion: 1,
+    datasetId: "dataset-1",
+    datasetFingerprint: "dataset-fingerprint",
+    modelId: "model-1",
+    modelPath: "data/models/model.json",
+    split: "test",
+    topK: 10,
+    trainingExamples: 12,
+    fitExamples: 12,
+    metrics: [{
+      baseline: "gnn",
+      values: {
+        examples: 4,
+        snapshots: 1,
+        spearman: 0.5,
+        pairwiseAccuracy: 0.75,
+        topKOverlap: 1
+      }
+    }]
+  };
+  expect(validateEvaluationResult(result)).toEqual(result);
+  expect(() => validateEvaluationResult({ ...result, metrics: [{ ...result.metrics[0], values: { ...result.metrics[0].values, topKOverlap: 2 } }] })).toThrow("between 0 and 1");
+});
+
+test("benchmark results validate canonical throughput and thread sweeps", () => {
+  const result = {
+    schemaVersion: 1,
+    benchmark: "routing",
+    workload: "routing",
+    snapshotId: "snapshot-1",
+    warmupUnits: 4,
+    measuredUnits: 30,
+    medianMilliseconds: 12.5,
+    p95Milliseconds: 18.2,
+    throughput: 42.1,
+    throughputUnit: "queries_per_second",
+    threadConfiguration: { rayonThreads: 4 }
+  };
+  expect(validateBenchmarkResult(result)).toEqual(result);
+  expect(validateBenchmarkResult({
+    schemaVersion: 1,
+    benchmark: "threads",
+    workload: "mixed",
+    reports: [{ workload: "train-step", threads: 4, throughput: 1.2 }]
+  }).reports).toHaveLength(1);
+  expect(() => validateBenchmarkResult({ ...result, throughput: -1 })).toThrow("non-negative");
 });

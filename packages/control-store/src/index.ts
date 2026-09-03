@@ -4,3 +4,4 @@ export * from "./manifest.ts";
 export * from "./similarity.ts";
 export * from "./experiments.ts";
 export * from "./schema.ts";
+export * from "./schedule.ts";

@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://transit-lab.local/schemas/training-control.v1.json",
+  "title": "Transit Lab training control v1",
+  "type": "object",
+  "required": ["schemaVersion", "desiredState"],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "desiredState": {"enum": ["running", "paused", "cancelled"]},
+    "checkpointRequested": {"type": "boolean"},
+    "requestedAt": {"type": ["string", "null"], "format": "date-time"},
+    "reason": {"type": ["string", "null"]}
+  },
+  "additionalProperties": false
+}

@@ -34,7 +34,7 @@ pub fn denormalize_criticality_targets(targets: Vec<f32>) -> Vec<f32> {
         .collect()
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ModelConfig {
     pub hidden_dimension: usize,
     pub temporal_dimension: usize,
@@ -150,6 +150,58 @@ pub struct Reconstruction {
     pub line_features: FeatureMatrix,
     pub served_by_logits: Vec<f32>,
     pub transfer_logits: Vec<f32>,
+}
+
+/// Gradients accumulated by the dependency-free decoder.  The reference
+/// backend deliberately keeps this state explicit so a checkpoint can be
+/// taken between graph units without pretending that accumulation is merely a
+/// configuration value.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DecoderGradients {
+    pub station_weights: Vec<f32>,
+    pub station_bias: Vec<f32>,
+    pub line_weights: Vec<f32>,
+    pub line_bias: Vec<f32>,
+    pub target_count: u64,
+    pub graph_count: u64,
+}
+
+impl DecoderGradients {
+    pub fn zero(hidden: usize, station_width: usize, line_width: usize) -> Self {
+        Self {
+            station_weights: vec![0.0; hidden * station_width],
+            station_bias: vec![0.0; station_width],
+            line_weights: vec![0.0; hidden * line_width],
+            line_bias: vec![0.0; line_width],
+            target_count: 0,
+            graph_count: 0,
+        }
+    }
+
+    pub fn add_assign(&mut self, other: &Self) -> Result<()> {
+        if self.station_weights.len() != other.station_weights.len()
+            || self.station_bias.len() != other.station_bias.len()
+            || self.line_weights.len() != other.line_weights.len()
+            || self.line_bias.len() != other.line_bias.len()
+        {
+            bail!("decoder gradient shapes do not match");
+        }
+        for (left, right) in self.station_weights.iter_mut().zip(&other.station_weights) {
+            *left += right;
+        }
+        for (left, right) in self.station_bias.iter_mut().zip(&other.station_bias) {
+            *left += right;
+        }
+        for (left, right) in self.line_weights.iter_mut().zip(&other.line_weights) {
+            *left += right;
+        }
+        for (left, right) in self.line_bias.iter_mut().zip(&other.line_bias) {
+            *left += right;
+        }
+        self.target_count = self.target_count.saturating_add(other.target_count);
+        self.graph_count = self.graph_count.saturating_add(other.graph_count);
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -389,21 +441,113 @@ impl ReferenceRelationalAutoencoder {
         ))
     }
 
-    /// Train the reference backend's decoder with a small deterministic SGD
-    /// step. The encoder remains fixed; GPU/LibTorch training is provided by
-    /// the optional `tch-backend` feature.
-    pub fn train_decoder_step(
+    /// Calculate a decoder gradient without applying it.  Keeping calculation
+    /// and application separate lets the training session accumulate several
+    /// variable-sized city graphs into one optimizer update.
+    pub fn decoder_gradients(
         &mut self,
         graph: &GraphTensor,
         mask: &MaskSelection,
-        learning_rate: f32,
-    ) -> Result<f32> {
+    ) -> Result<(DecoderGradients, f32)> {
         graph.validate()?;
         validate_mask(graph, mask)?;
         self.initialize_for_graph(graph);
         self.validate_decoder_dimensions(graph)?;
         let embeddings = self.encode_inner(graph, mask)?;
+        let mut gradients = DecoderGradients::zero(
+            self.config.hidden_dimension,
+            graph.station_features.cols,
+            graph.line_features.cols,
+        );
         let mut loss = 0.0_f64;
+
+        let station_weights = self
+            .station_decoder_weights
+            .as_ref()
+            .expect("decoder initialized");
+        let station_bias = self
+            .station_decoder_bias
+            .as_ref()
+            .expect("decoder initialized");
+        for (row, embedding) in embeddings.station.iter().enumerate() {
+            if !mask.station_rows[row] {
+                continue;
+            }
+            for output in 0..graph.station_features.cols {
+                let offset = output * self.config.hidden_dimension;
+                let prediction = station_bias[output]
+                    + station_weights[offset..offset + self.config.hidden_dimension]
+                        .iter()
+                        .zip(embedding)
+                        .map(|(weight, value)| weight * value)
+                        .sum::<f32>();
+                let error = prediction - graph.station_features.row(row)[output];
+                loss += f64::from(error * error);
+                gradients.station_bias[output] += error;
+                for (gradient, value) in gradients.station_weights
+                    [offset..offset + self.config.hidden_dimension]
+                    .iter_mut()
+                    .zip(embedding)
+                {
+                    *gradient += error * value;
+                }
+                gradients.target_count = gradients.target_count.saturating_add(1);
+            }
+        }
+
+        let line_weights = self
+            .line_decoder_weights
+            .as_ref()
+            .expect("decoder initialized");
+        let line_bias = self
+            .line_decoder_bias
+            .as_ref()
+            .expect("decoder initialized");
+        for (row, embedding) in embeddings.line.iter().enumerate() {
+            if !mask.line_rows[row] {
+                continue;
+            }
+            for output in 0..graph.line_features.cols {
+                let offset = output * self.config.hidden_dimension;
+                let prediction = line_bias[output]
+                    + line_weights[offset..offset + self.config.hidden_dimension]
+                        .iter()
+                        .zip(embedding)
+                        .map(|(weight, value)| weight * value)
+                        .sum::<f32>();
+                let error = prediction - graph.line_features.row(row)[output];
+                loss += f64::from(error * error);
+                gradients.line_bias[output] += error;
+                for (gradient, value) in gradients.line_weights
+                    [offset..offset + self.config.hidden_dimension]
+                    .iter_mut()
+                    .zip(embedding)
+                {
+                    *gradient += error * value;
+                }
+                gradients.target_count = gradients.target_count.saturating_add(1);
+            }
+        }
+        gradients.graph_count = 1;
+        let target_count = gradients.target_count;
+        Ok((gradients, (loss / target_count.max(1) as f64) as f32))
+    }
+
+    /// Apply accumulated decoder gradients.  `normalizer` is normally the
+    /// number of scalar reconstruction targets, which makes graph sizes and
+    /// mask density contribute by their mean rather than by raw count.
+    pub fn apply_decoder_gradients(
+        &mut self,
+        gradients: &DecoderGradients,
+        learning_rate: f32,
+        weight_decay: f32,
+        normalizer: u64,
+    ) -> Result<()> {
+        self.initialize_for_graph_dimensions(
+            gradients.station_bias.len(),
+            gradients.line_bias.len(),
+        );
+        let hidden = self.config.hidden_dimension;
         let station_weights = self
             .station_decoder_weights
             .as_mut()
@@ -412,34 +556,19 @@ impl ReferenceRelationalAutoencoder {
             .station_decoder_bias
             .as_mut()
             .expect("decoder initialized");
-        for (row, embedding) in embeddings.station.iter().enumerate() {
-            if !mask.station_rows[row] {
-                continue;
-            }
-            for (output, bias) in station_bias
-                .iter_mut()
-                .enumerate()
-                .take(graph.station_features.cols)
-            {
-                let offset = output * self.config.hidden_dimension;
-                let prediction = *bias
-                    + station_weights[offset..offset + self.config.hidden_dimension]
-                        .iter()
-                        .zip(embedding)
-                        .map(|(weight, value)| weight * value)
-                        .sum::<f32>();
-                let error = prediction - graph.station_features.row(row)[output];
-                loss += f64::from(error * error);
-                *bias -= learning_rate * error;
-                for (weight, value) in station_weights
-                    [offset..offset + self.config.hidden_dimension]
-                    .iter_mut()
-                    .zip(embedding)
-                {
-                    *weight -= learning_rate * error * value;
-                }
-            }
+        if station_weights.len() != gradients.station_weights.len()
+            || station_bias.len() != gradients.station_bias.len()
+        {
+            bail!("station decoder gradients do not match model dimensions");
         }
+        let divisor = normalizer.max(1) as f32;
+        for (weight, gradient) in station_weights.iter_mut().zip(&gradients.station_weights) {
+            *weight -= learning_rate * (gradient / divisor + weight_decay * *weight);
+        }
+        for (bias, gradient) in station_bias.iter_mut().zip(&gradients.station_bias) {
+            *bias -= learning_rate * gradient / divisor;
+        }
+
         let line_weights = self
             .line_decoder_weights
             .as_mut()
@@ -448,37 +577,45 @@ impl ReferenceRelationalAutoencoder {
             .line_decoder_bias
             .as_mut()
             .expect("decoder initialized");
-        for (row, embedding) in embeddings.line.iter().enumerate() {
-            if !mask.line_rows[row] {
-                continue;
-            }
-            for (output, bias) in line_bias
-                .iter_mut()
-                .enumerate()
-                .take(graph.line_features.cols)
-            {
-                let offset = output * self.config.hidden_dimension;
-                let prediction = *bias
-                    + line_weights[offset..offset + self.config.hidden_dimension]
-                        .iter()
-                        .zip(embedding)
-                        .map(|(weight, value)| weight * value)
-                        .sum::<f32>();
-                let error = prediction - graph.line_features.row(row)[output];
-                loss += f64::from(error * error);
-                *bias -= learning_rate * error;
-                for (weight, value) in line_weights[offset..offset + self.config.hidden_dimension]
-                    .iter_mut()
-                    .zip(embedding)
-                {
-                    *weight -= learning_rate * error * value;
-                }
-            }
+        if line_weights.len() != gradients.line_weights.len()
+            || line_bias.len() != gradients.line_bias.len()
+        {
+            bail!("line decoder gradients do not match model dimensions");
         }
-        let count = mask.station_rows.iter().filter(|value| **value).count()
-            * graph.station_features.cols
-            + mask.line_rows.iter().filter(|value| **value).count() * graph.line_features.cols;
-        Ok((loss / count.max(1) as f64) as f32)
+        for (weight, gradient) in line_weights.iter_mut().zip(&gradients.line_weights) {
+            *weight -= learning_rate * (gradient / divisor + weight_decay * *weight);
+        }
+        for (bias, gradient) in line_bias.iter_mut().zip(&gradients.line_bias) {
+            *bias -= learning_rate * gradient / divisor;
+        }
+        let _ = hidden;
+        Ok(())
+    }
+
+    fn initialize_for_graph_dimensions(&mut self, station_width: usize, line_width: usize) {
+        let hidden = self.config.hidden_dimension;
+        if self.station_decoder_weights.is_none() {
+            self.station_decoder_weights = Some(decoder_weights(hidden, station_width, 401));
+            self.station_decoder_bias = Some(vec![0.0; station_width]);
+        }
+        if self.line_decoder_weights.is_none() {
+            self.line_decoder_weights = Some(decoder_weights(hidden, line_width, 431));
+            self.line_decoder_bias = Some(vec![0.0; line_width]);
+        }
+    }
+
+    /// Train the reference backend's decoder with a deterministic SGD step.
+    /// The encoder remains fixed; GPU/LibTorch training is provided by the
+    /// optional `tch-backend` feature.
+    pub fn train_decoder_step(
+        &mut self,
+        graph: &GraphTensor,
+        mask: &MaskSelection,
+        learning_rate: f32,
+    ) -> Result<f32> {
+        let (gradients, loss) = self.decoder_gradients(graph, mask)?;
+        self.apply_decoder_gradients(&gradients, learning_rate, 0.0, gradients.target_count)?;
+        Ok(loss)
     }
 
     fn validate_decoder_dimensions(&self, graph: &GraphTensor) -> Result<()> {
