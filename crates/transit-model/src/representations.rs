@@ -258,12 +258,12 @@ impl ReferenceLineRepresentationEncoder {
             );
 
             let service = project(
-                &service_input,
+                service_input,
                 self.config.service_dimension,
                 self.config.seed + 23,
             );
             let geometry = project(
-                &geometry_input,
+                geometry_input,
                 self.config.geometry_dimension,
                 self.config.seed + 29,
             );
@@ -707,7 +707,7 @@ fn role_features(graph: &GraphTensor, embeddings: &Embeddings, line: usize) -> V
         }
         let row = graph.station_features.row(*station as usize);
         station_context.extend([
-            row.get(0).copied().unwrap_or(0.0),
+            row.first().copied().unwrap_or(0.0),
             row.get(1).copied().unwrap_or(0.0),
             row.get(3).copied().unwrap_or(0.0),
             row.get(4).copied().unwrap_or(0.0),

@@ -28,8 +28,9 @@ use transit_inference::{
 use transit_labels::{
     build_routing_baseline, generate_line_removal_labels, generate_line_removal_labels_resumable,
     generate_selected_line_removal_labels, load_jsonl, load_routing_baseline, sample_origins,
-    save_jsonl, save_label_manifest, save_label_manifest_with_metadata, save_routing_baseline,
-    spearman_rank, LabelGenerationConfig, OriginCandidate,
+    save_jsonl, save_label_manifest_with_metadata, save_routing_baseline, spearman_rank,
+    LabelGenerationConfig, OriginCandidate, LABEL_BATCH_SCHEMA_VERSION,
+    LABEL_MANIFEST_SCHEMA_VERSION,
 };
 #[cfg(feature = "tch-backend")]
 use transit_model::{denormalize_criticality_targets, LineEmbedding};
@@ -37,7 +38,7 @@ use transit_model::{
     MaskConfig, MaskSelection, ModelConfig, ReferenceLineRepresentationEncoder,
     ReferenceRelationalAutoencoder,
 };
-use transit_router::{Router, RouterConfig};
+use transit_router::{Router, RouterConfig, ROUTER_ALGORITHM_VERSION};
 use transit_search::{rank_similar_lines, SimilarityProfile};
 use transit_training::{
     benchmark_reference_train_step, build_embedding_cache, list_training_checkpoints,
@@ -352,6 +353,10 @@ struct MultiTaskArgs {
     /// by a dataset manifest. Intended for local development only.
     #[arg(long)]
     allow_unpartitioned_input: bool,
+    /// Explicitly acknowledge training on a validation or test partition.
+    /// This is for diagnostics only; the worker always uses the train split.
+    #[arg(long)]
+    allow_nontrain_training_split: bool,
     #[arg(long)]
     config: Option<PathBuf>,
     #[arg(long)]
@@ -1256,7 +1261,7 @@ fn command_build_dataset(args: BuildDatasetArgs) -> Result<()> {
         })
         .collect::<Result<Vec<_>>>()?;
     let mut labels = Vec::with_capacity(graphs.len());
-    for index in 0..graphs.len() {
+    for (index, graph) in graphs.iter().enumerate() {
         let rows = args
             .labels
             .get(index)
@@ -1266,19 +1271,19 @@ fn command_build_dataset(args: BuildDatasetArgs) -> Result<()> {
             .transpose()?
             .unwrap_or_default();
         for label in &rows {
-            if label.snapshot != graphs[index].manifest.snapshot_id {
+            if label.snapshot != graph.manifest.snapshot_id {
                 bail!(
                     "label {} belongs to {}, expected {}",
                     label.line,
                     label.snapshot,
-                    graphs[index].manifest.snapshot_id
+                    graph.manifest.snapshot_id
                 );
             }
-            if label.line.0 as usize >= graphs[index].manifest.line_count {
+            if label.line.0 as usize >= graph.manifest.line_count {
                 bail!(
                     "label line {} is outside graph {}",
                     label.line,
-                    graphs[index].manifest.snapshot_id
+                    graph.manifest.snapshot_id
                 );
             }
         }
@@ -2216,6 +2221,7 @@ fn command_pretrain_libtorch(args: PretrainArgs, config: PretrainingConfig) -> R
             graphs: vec![args.graph],
             labels: Vec::new(),
             allow_unpartitioned_input: true,
+            allow_nontrain_training_split: false,
             config: args.config,
             output: args.output,
             seed: args.seed,
@@ -2382,6 +2388,12 @@ fn load_multitask_datasets(
             bail!("--allow-unpartitioned-input is only valid with --graph");
         }
         let split = DatasetSplit::parse(&args.split)?;
+        if split != DatasetSplit::Train && !args.allow_nontrain_training_split {
+            bail!(
+                "training on the {} split requires --allow-nontrain-training-split",
+                split.as_str()
+            );
+        }
         let collection = load_dataset_split(dataset, split).with_context(|| {
             format!(
                 "loading {} split from dataset {}",
@@ -2405,6 +2417,9 @@ fn load_multitask_datasets(
         bail!(
             "repeated --graph training inputs are unpartitioned; provide --dataset or pass --allow-unpartitioned-input for local development"
         );
+    }
+    if args.allow_nontrain_training_split {
+        bail!("--allow-nontrain-training-split requires --dataset");
     }
     if DatasetSplit::parse(&args.split)? != DatasetSplit::Train {
         bail!("--split is only available with --dataset");
@@ -3308,7 +3323,13 @@ fn command_demo(args: DemoArgs) -> Result<()> {
     );
     let labels_path = args.output.join("labels.jsonl");
     save_jsonl(&labels_path, &labels)?;
-    save_label_manifest(&labels_path, &label_config, origins.len())?;
+    save_label_manifest_with_metadata(
+        &labels_path,
+        &label_config,
+        origins.len(),
+        network.snapshot_id.clone(),
+        &departures,
+    )?;
     write_artifact_manifest(&labels_path, "criticality-labels")?;
     let pretraining = PretrainingConfig {
         model: ModelConfig {
@@ -3552,6 +3573,117 @@ fn write_artifact_manifest(output: &Path, kind: &str) -> Result<()> {
     write_artifact_manifest_for_paths(output, kind, &[output])
 }
 
+fn artifact_json(path: &Path, description: &str) -> Result<Value> {
+    let bytes =
+        fs::read(path).with_context(|| format!("reading {description} {}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("decoding {description} {}", path.display()))
+}
+
+fn artifact_metadata(output: &Path, kind: &str) -> Result<Value> {
+    match kind {
+        "routing-baseline" => {
+            let baseline = artifact_json(output, "routing baseline")?;
+            let version = baseline
+                .get("router_algorithm_version")
+                .and_then(Value::as_str)
+                .context("routing baseline is missing router_algorithm_version")?;
+            if version != ROUTER_ALGORITHM_VERSION {
+                bail!(
+                    "routing baseline uses router {}; expected {}",
+                    version,
+                    ROUTER_ALGORITHM_VERSION
+                );
+            }
+            let snapshot = baseline
+                .get("snapshot_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .context("routing baseline is missing snapshot_id")?;
+            Ok(json!({
+                "snapshotId": snapshot,
+                "routerAlgorithmVersion": ROUTER_ALGORITHM_VERSION,
+            }))
+        }
+        "criticality-labels" => {
+            let manifest_path = output.with_extension("manifest.json");
+            let manifest = artifact_json(&manifest_path, "label manifest")?;
+            let schema = manifest
+                .get("schema_version")
+                .and_then(Value::as_str)
+                .context("label manifest is missing schema_version")?;
+            if schema != LABEL_MANIFEST_SCHEMA_VERSION {
+                bail!(
+                    "unsupported label manifest schema {}; expected {}",
+                    schema,
+                    LABEL_MANIFEST_SCHEMA_VERSION
+                );
+            }
+            let version = manifest
+                .get("router_algorithm_version")
+                .and_then(Value::as_str)
+                .context("label manifest is missing router_algorithm_version")?;
+            if version != ROUTER_ALGORITHM_VERSION {
+                bail!(
+                    "label manifest uses router {}; expected {}",
+                    version,
+                    ROUTER_ALGORITHM_VERSION
+                );
+            }
+            let snapshot = manifest
+                .get("snapshot_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .context("label manifest is missing snapshot_id")?;
+            let policy = manifest
+                .get("policy_fingerprint")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .context("label manifest is missing policy_fingerprint")?;
+
+            let batch_path = output.with_extension("batch.json");
+            if batch_path.is_file() {
+                let batch = artifact_json(&batch_path, "label batch manifest")?;
+                let batch_schema = batch
+                    .get("schema_version")
+                    .and_then(Value::as_str)
+                    .context("label batch manifest is missing schema_version")?;
+                if batch_schema != LABEL_BATCH_SCHEMA_VERSION {
+                    bail!(
+                        "unsupported label batch schema {}; expected {}",
+                        batch_schema,
+                        LABEL_BATCH_SCHEMA_VERSION
+                    );
+                }
+                let batch_version = batch
+                    .get("router_algorithm_version")
+                    .and_then(Value::as_str)
+                    .context("label batch manifest is missing router_algorithm_version")?;
+                if batch_version != ROUTER_ALGORITHM_VERSION {
+                    bail!(
+                        "label batch manifest uses router {}; expected {}",
+                        batch_version,
+                        ROUTER_ALGORITHM_VERSION
+                    );
+                }
+                if batch.get("snapshot_id").and_then(Value::as_str) != Some(snapshot)
+                    || batch.get("policy_fingerprint").and_then(Value::as_str) != Some(policy)
+                {
+                    bail!("label and batch manifests do not describe the same inputs");
+                }
+            }
+
+            Ok(json!({
+                "snapshotId": snapshot,
+                "routerAlgorithmVersion": ROUTER_ALGORITHM_VERSION,
+                "labelSchemaVersion": LABEL_MANIFEST_SCHEMA_VERSION,
+                "policyFingerprint": policy,
+            }))
+        }
+        _ => Ok(json!({})),
+    }
+}
+
 fn write_artifact_manifest_for_paths(output: &Path, kind: &str, paths: &[&Path]) -> Result<()> {
     if !output.exists() {
         bail!("cannot manifest missing Rust output {}", output.display());
@@ -3570,6 +3702,7 @@ fn write_artifact_manifest_for_paths(output: &Path, kind: &str, paths: &[&Path])
     if files.is_empty() {
         bail!("cannot manifest empty Rust output {}", output.display());
     }
+    let metadata = artifact_metadata(output, kind)?;
     let file_bytes = serde_json::to_vec(&files)?;
     let digest = hex_digest(&sha256_bytes(&file_bytes));
     let manifest = json!({
@@ -3588,7 +3721,7 @@ fn write_artifact_manifest_for_paths(output: &Path, kind: &str, paths: &[&Path])
             "configFingerprint": std::env::var("TRANSIT_CONFIG_FINGERPRINT").ok()
         },
         "files": files,
-        "metadata": {}
+        "metadata": metadata
     });
     let manifest_path = artifact_manifest_path(output);
     if let Ok(existing) = fs::read(&manifest_path) {
@@ -3597,6 +3730,7 @@ fn write_artifact_manifest_for_paths(output: &Path, kind: &str, paths: &[&Path])
         if existing["fingerprint"] != manifest["fingerprint"]
             || existing["files"] != manifest["files"]
             || existing["kind"] != manifest["kind"]
+            || existing["metadata"] != manifest["metadata"]
         {
             bail!(
                 "refusing to overwrite immutable artifact manifest {}",
@@ -3655,6 +3789,7 @@ fn write_artifact_manifest_for_paths(output: &Path, kind: &str, paths: &[&Path])
                 if existing["fingerprint"] == manifest["fingerprint"]
                     && existing["files"] == manifest["files"]
                     && existing["kind"] == manifest["kind"]
+                    && existing["metadata"] == manifest["metadata"]
                 {
                     Ok(())
                 } else {
@@ -3945,12 +4080,13 @@ mod tests {
         .unwrap();
         save_dataset_manifest(&directory.path().join("dataset-manifest.json"), &manifest).unwrap();
 
-        let args = MultiTaskArgs {
+        let mut args = MultiTaskArgs {
             dataset: Some(directory.path().to_path_buf()),
             split: "train".into(),
             graphs: Vec::new(),
             labels: Vec::new(),
             allow_unpartitioned_input: false,
+            allow_nontrain_training_split: false,
             config: None,
             output: directory.path().join("model.json"),
             seed: None,
@@ -3972,6 +4108,15 @@ mod tests {
                 gradient_accumulation: None,
             },
         };
+        args.split = "test".into();
+        let error = match load_multitask_datasets(&args) {
+            Ok(_) => panic!("non-train split should require an explicit acknowledgement"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("--allow-nontrain-training-split"));
+        args.split = "train".into();
         let (graphs, labels) = load_multitask_datasets(&args).unwrap();
         assert_eq!(
             graphs

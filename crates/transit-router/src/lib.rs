@@ -5,6 +5,14 @@
 //! with a small Dijkstra closure. Independent origin/departure/intervention
 //! queries can therefore be parallelized by the labels crate.
 
+/// Semantic version for routing results consumed by downstream artifacts.
+///
+/// This must change whenever routing semantics change in a way that can alter
+/// arrivals, transfer counts, or intervention outcomes. Consumers include the
+/// version in their fingerprints so labels from an older algorithm cannot be
+/// reused silently.
+pub const ROUTER_ALGORITHM_VERSION: &str = "transit-router-v2";
+
 use anyhow::{bail, Result};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -307,7 +315,7 @@ impl Router {
         disabled_lines: &LineMask,
         closed_station: Option<StationIndex>,
         frequency_multipliers: Option<&[f32]>,
-        mut workspace: Option<&mut RoutingWorkspace>,
+        workspace: Option<&mut RoutingWorkspace>,
     ) -> OneToAllResult {
         let station_count = self.data.station_count;
         if departure == INF_TIME {
@@ -332,7 +340,7 @@ impl Router {
         let maximum_rides = self.config.maximum_transfers as usize + 1;
         let rounds = maximum_rides.saturating_add(1);
         let mut owned_arrivals;
-        let arrivals_by_rides = if let Some(workspace) = workspace.as_deref_mut() {
+        let arrivals_by_rides = if let Some(workspace) = workspace {
             workspace.prepare(station_count, rounds);
             &mut workspace.arrivals_by_rides
         } else {
@@ -380,56 +388,62 @@ impl Router {
                     .unwrap_or(1.0);
                 // Scan each marked pattern once. This is the marked-route
                 // RAPTOR step: a route is considered only when it serves a
-                // station improved in the previous round.
-                let mut boarded_trip: Option<(usize, u32)> = None;
+                // station improved in the previous round. Keep all boardable
+                // trips rather than assuming the timetable is non-overtaking:
+                // a later departure can arrive earlier downstream.
+                let retained_trip_indices = retained_trip_indices(pattern, multiplier);
+                let mut boarded_trips: Vec<usize> = Vec::new();
+                let mut trip_is_boarded = vec![false; pattern.trips.len()];
                 for position in 0..pattern.stops.len() {
                     let station = pattern.stops[position];
                     let station_slot = station.0 as usize;
                     if station_slot >= station_count {
                         continue;
                     }
-                    if closed_station != Some(station)
-                        && previous_arrivals[station_slot] != INF_TIME
-                    {
-                        if let Some((trip_index, trip)) = earliest_boardable_trip_with_multiplier(
-                            pattern,
-                            position,
-                            previous_arrivals[station_slot],
-                            multiplier,
-                        ) {
-                            let departure_time = trip.stop_times[position].departure;
-                            if boarded_trip
-                                .as_ref()
-                                .map(|(_, current_departure)| departure_time < *current_departure)
-                                .unwrap_or(true)
+
+                    // A trip selected at an earlier position can be used to
+                    // alight here. A trip selected at this position must not
+                    // make its own boarding stop reachable at its scheduled
+                    // arrival time.
+                    for &trip_index in &boarded_trips {
+                        if let Some(stop_time) = pattern
+                            .trips
+                            .get(trip_index)
+                            .and_then(|trip| trip.stop_times.get(position))
+                        {
+                            let arrival = stop_time.arrival;
+                            if stop_time.dropoff_type != 1
+                                && closed_station != Some(station)
+                                && arrival != INF_TIME
+                                && arrival >= departure
+                                && arrival.saturating_sub(departure)
+                                    <= self.config.maximum_journey_seconds
+                                && better(arrival, 0, current_arrivals[station_slot], 0)
                             {
-                                boarded_trip = Some((trip_index, departure_time));
+                                current_arrivals[station_slot] = arrival;
+                                route_seeds.push(station_slot);
                             }
                         }
                     }
-                    let Some((trip_index, _)) = boarded_trip else {
-                        continue;
-                    };
-                    let Some(stop_time) = pattern
-                        .trips
-                        .get(trip_index)
-                        .and_then(|trip| trip.stop_times.get(position))
-                    else {
-                        continue;
-                    };
-                    if stop_time.dropoff_type == 1 || closed_station == Some(station) {
-                        continue;
-                    }
-                    let arrival = stop_time.arrival;
-                    if arrival == INF_TIME
-                        || arrival < departure
-                        || arrival.saturating_sub(departure) > self.config.maximum_journey_seconds
+
+                    // Boarding happens after alighting at the current stop,
+                    // and affects only positions after this one. Compare
+                    // departures at this same position; a departure at an
+                    // earlier boarding stop is not comparable.
+                    if closed_station != Some(station)
+                        && previous_arrivals[station_slot] != INF_TIME
                     {
-                        continue;
-                    }
-                    if better(arrival, 0, current_arrivals[station_slot], 0) {
-                        current_arrivals[station_slot] = arrival;
-                        route_seeds.push(station_slot);
+                        for &trip_index in &retained_trip_indices {
+                            let trip = &pattern.trips[trip_index];
+                            let stop_time = &trip.stop_times[position];
+                            if !trip_is_boarded[trip_index]
+                                && stop_time.pickup_type != 1
+                                && stop_time.departure >= previous_arrivals[station_slot]
+                            {
+                                trip_is_boarded[trip_index] = true;
+                                boarded_trips.push(trip_index);
+                            }
+                        }
                     }
                 }
             }
@@ -600,6 +614,7 @@ impl Router {
                 )
                 .count();
         });
+        let batch_started = Instant::now();
         let durations = pool.install(|| {
             (0..measured_queries)
                 .into_par_iter()
@@ -613,6 +628,7 @@ impl Router {
                 )
                 .collect::<Vec<_>>()
         });
+        let batch_seconds = batch_started.elapsed().as_secs_f64();
         let mut durations = durations;
         durations.sort_by(f64::total_cmp);
         let percentile = |fraction: f64| {
@@ -621,14 +637,13 @@ impl Router {
                 .min(durations.len() - 1);
             durations[index]
         };
-        let seconds = durations.iter().sum::<f64>() / 1_000.0;
         Ok(RoutingBenchmarkReport {
             warmup_queries,
             measured_queries,
             median_milliseconds: percentile(0.50),
             p95_milliseconds: percentile(0.95),
-            queries_per_second: if seconds > 0.0 {
-                measured_queries as f64 / seconds
+            queries_per_second: if batch_seconds > 0.0 {
+                measured_queries as f64 / batch_seconds
             } else {
                 0.0
             },
@@ -688,14 +703,9 @@ impl Router {
     }
 }
 
-fn earliest_boardable_trip_with_multiplier(
-    pattern: &RoutingPattern,
-    position: usize,
-    ready: u32,
-    multiplier: f32,
-) -> Option<(usize, &RoutingTrip)> {
+fn retained_trip_indices(pattern: &RoutingPattern, multiplier: f32) -> Vec<usize> {
     if pattern.trips.is_empty() || !multiplier.is_finite() || multiplier <= 0.0 {
-        return None;
+        return Vec::new();
     }
     let multiplier = multiplier.min(1.0);
     let keep_count = if multiplier >= 1.0 {
@@ -705,22 +715,9 @@ fn earliest_boardable_trip_with_multiplier(
             .max(1)
             .min(pattern.trips.len())
     };
-    pattern
-        .trips
-        .iter()
-        .enumerate()
-        .filter(|(trip_index, trip)| {
-            trip_is_retained(*trip_index, pattern.trips.len(), keep_count)
-                && position < trip.stop_times.len()
-                && {
-                    let time = &trip.stop_times[position];
-                    time.pickup_type != 1 && time.departure >= ready
-                }
-        })
-        .min_by_key(|(_, trip)| {
-            let time = &trip.stop_times[position];
-            (time.departure, time.arrival)
-        })
+    (0..pattern.trips.len())
+        .filter(|trip_index| trip_is_retained(*trip_index, pattern.trips.len(), keep_count))
+        .collect()
 }
 
 fn trip_is_retained(index: usize, trip_count: usize, keep_count: usize) -> bool {
@@ -737,6 +734,8 @@ fn better(new_arrival: u32, new_rides: usize, old_arrival: u32, old_rides: usize
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
 
     fn time(arrival: u32, departure: u32) -> StopTime {
         StopTime {
@@ -754,6 +753,555 @@ mod tests {
                 .map(|(arrival, departure)| time(*arrival, *departure))
                 .collect(),
         }
+    }
+
+    fn restricted_trip(times: &[(u32, u32, u8, u8)]) -> RoutingTrip {
+        RoutingTrip {
+            stop_times: times
+                .iter()
+                .map(|(arrival, departure, pickup_type, dropoff_type)| StopTime {
+                    arrival: *arrival,
+                    departure: *departure,
+                    pickup_type: *pickup_type,
+                    dropoff_type: *dropoff_type,
+                })
+                .collect(),
+        }
+    }
+
+    fn exhaustive_transfer_closure(
+        data: &RoutingData,
+        config: &RouterConfig,
+        arrivals: &mut [u32],
+        seeds: &[usize],
+        departure: u32,
+        closed_station: Option<StationIndex>,
+    ) {
+        let mut queue = BinaryHeap::<Reverse<(u32, usize)>>::new();
+        for &station in seeds {
+            if station < arrivals.len() && arrivals[station] != INF_TIME {
+                queue.push(Reverse((arrivals[station], station)));
+            }
+        }
+        while let Some(Reverse((time, station))) = queue.pop() {
+            if arrivals[station] != time {
+                continue;
+            }
+            for transfer in &data.transfers {
+                if transfer.from.0 as usize != station
+                    || closed_station == Some(transfer.from)
+                    || closed_station == Some(transfer.to)
+                {
+                    continue;
+                }
+                let target = transfer.to.0 as usize;
+                if target >= arrivals.len() {
+                    continue;
+                }
+                let arrival = time.saturating_add(transfer.seconds);
+                if arrival < departure
+                    || arrival.saturating_sub(departure) > config.maximum_journey_seconds
+                {
+                    continue;
+                }
+                if arrival < arrivals[target] {
+                    arrivals[target] = arrival;
+                    queue.push(Reverse((arrival, target)));
+                }
+            }
+        }
+    }
+
+    fn exhaustive_trip_is_retained(index: usize, trip_count: usize, keep_count: usize) -> bool {
+        keep_count >= trip_count || ((index * keep_count) % trip_count) < keep_count
+    }
+
+    fn exhaustive_keep_count(trip_count: usize, multiplier: f32) -> Option<usize> {
+        if trip_count == 0 || !multiplier.is_finite() || multiplier <= 0.0 {
+            return None;
+        }
+        let multiplier = multiplier.min(1.0);
+        Some(if multiplier >= 1.0 {
+            trip_count
+        } else {
+            ((trip_count as f32 * multiplier).round() as usize)
+                .max(1)
+                .min(trip_count)
+        })
+    }
+
+    /// Deliberately slow reference implementation. It considers every valid
+    /// boarding/alighting pair instead of sharing the production marked-route
+    /// scan, so differential failures identify route-scan errors rather than
+    /// duplicated implementation mistakes.
+    fn exhaustive_one_to_all(
+        data: &RoutingData,
+        config: &RouterConfig,
+        origin: StationIndex,
+        departure: u32,
+        disabled_lines: &LineMask,
+        closed_station: Option<StationIndex>,
+        frequency_multipliers: Option<&[f32]>,
+    ) -> OneToAllResult {
+        if departure == INF_TIME
+            || origin.0 as usize >= data.station_count
+            || closed_station == Some(origin)
+        {
+            return OneToAllResult {
+                arrival_seconds: vec![INF_TIME; data.station_count],
+                transfers: vec![INF_RIDES; data.station_count],
+            };
+        }
+
+        let maximum_rides = config.maximum_transfers as usize + 1;
+        let mut arrivals_by_rides =
+            vec![vec![INF_TIME; data.station_count]; maximum_rides.saturating_add(1)];
+        arrivals_by_rides[0][origin.0 as usize] = departure;
+        exhaustive_transfer_closure(
+            data,
+            config,
+            &mut arrivals_by_rides[0],
+            &[origin.0 as usize],
+            departure,
+            closed_station,
+        );
+
+        for ride_count in 1..=maximum_rides {
+            let previous = arrivals_by_rides[ride_count - 1].clone();
+            let current = &mut arrivals_by_rides[ride_count];
+            for pattern in &data.patterns {
+                if disabled_lines.contains(pattern.line) {
+                    continue;
+                }
+                let multiplier = frequency_multipliers
+                    .and_then(|values| values.get(pattern.line.0 as usize))
+                    .copied()
+                    .unwrap_or(1.0);
+                let Some(keep_count) = exhaustive_keep_count(pattern.trips.len(), multiplier)
+                else {
+                    continue;
+                };
+                for (trip_index, trip) in pattern.trips.iter().enumerate() {
+                    if !exhaustive_trip_is_retained(trip_index, pattern.trips.len(), keep_count) {
+                        continue;
+                    }
+                    for board in 0..pattern.stops.len() {
+                        let board_station = pattern.stops[board];
+                        let board_slot = board_station.0 as usize;
+                        if board_slot >= data.station_count
+                            || closed_station == Some(board_station)
+                            || previous[board_slot] == INF_TIME
+                        {
+                            continue;
+                        }
+                        let board_time = &trip.stop_times[board];
+                        if board_time.pickup_type == 1
+                            || board_time.departure < previous[board_slot]
+                        {
+                            continue;
+                        }
+                        for alight in (board + 1)..pattern.stops.len() {
+                            let station = pattern.stops[alight];
+                            let station_slot = station.0 as usize;
+                            let stop_time = &trip.stop_times[alight];
+                            if station_slot >= data.station_count
+                                || closed_station == Some(station)
+                                || stop_time.dropoff_type == 1
+                            {
+                                continue;
+                            }
+                            let arrival = stop_time.arrival;
+                            if arrival == INF_TIME
+                                || arrival < departure
+                                || arrival.saturating_sub(departure)
+                                    > config.maximum_journey_seconds
+                            {
+                                continue;
+                            }
+                            current[station_slot] = current[station_slot].min(arrival);
+                        }
+                    }
+                }
+            }
+            let seeds = current
+                .iter()
+                .enumerate()
+                .filter_map(|(station, arrival)| (*arrival != INF_TIME).then_some(station))
+                .collect::<Vec<_>>();
+            exhaustive_transfer_closure(data, config, current, &seeds, departure, closed_station);
+        }
+
+        let mut result = OneToAllResult {
+            arrival_seconds: vec![INF_TIME; data.station_count],
+            transfers: vec![INF_RIDES; data.station_count],
+        };
+        for station in 0..data.station_count {
+            let mut best_rides = usize::MAX;
+            for (ride_count, arrivals) in arrivals_by_rides.iter().enumerate() {
+                let arrival = arrivals[station];
+                if arrival < result.arrival_seconds[station]
+                    || (arrival == result.arrival_seconds[station] && ride_count < best_rides)
+                {
+                    result.arrival_seconds[station] = arrival;
+                    best_rides = ride_count;
+                }
+            }
+            if result.arrival_seconds[station] != INF_TIME {
+                result.transfers[station] =
+                    best_rides.saturating_sub(1).min(u8::MAX as usize) as u8;
+            }
+        }
+        result
+    }
+
+    #[derive(Clone, Copy)]
+    struct TestRng {
+        state: u64,
+    }
+
+    impl TestRng {
+        fn new(seed: u64) -> Self {
+            Self {
+                state: seed.wrapping_add(0x9e37_79b9_7f4a_7c15),
+            }
+        }
+
+        fn next(&mut self) -> u64 {
+            self.state = self
+                .state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.state ^ (self.state >> 29)
+        }
+
+        fn range(&mut self, upper: usize) -> usize {
+            debug_assert!(upper > 0);
+            (self.next() as usize) % upper
+        }
+    }
+
+    fn generated_routing_data(seed: u64) -> RoutingData {
+        let mut rng = TestRng::new(seed);
+        let station_count = 2 + rng.range(7);
+        let line_count = 1 + rng.range(5);
+        let mut patterns = Vec::new();
+        for line in 0..line_count {
+            for _ in 0..(1 + rng.range(4)) {
+                let stop_count = 2 + rng.range(station_count - 1);
+                let mut stops = Vec::with_capacity(stop_count);
+                while stops.len() < stop_count {
+                    let station = StationIndex(rng.range(station_count) as u32);
+                    if !stops.contains(&station) {
+                        stops.push(station);
+                    }
+                }
+                let trip_count = 1 + rng.range(6);
+                let mut trips = Vec::with_capacity(trip_count);
+                for trip_index in 0..trip_count {
+                    let mut stop_times = Vec::with_capacity(stop_count);
+                    let mut departure = 86_400 + rng.range(12_000) as u32;
+                    if trip_index == 1 && trip_count > 1 {
+                        // Force some generated patterns to contain a later
+                        // departure that overtakes an earlier trip downstream.
+                        departure = departure.saturating_add(600);
+                    }
+                    for position in 0..stop_count {
+                        let arrival = departure;
+                        let dwell = rng.range(90) as u32;
+                        let pickup_type = (rng.range(25) == 0) as u8;
+                        let dropoff_type = (rng.range(25) == 0) as u8;
+                        stop_times.push(StopTime {
+                            arrival,
+                            departure: arrival + dwell,
+                            pickup_type,
+                            dropoff_type,
+                        });
+                        if position + 1 < stop_count {
+                            departure = arrival
+                                .saturating_add(dwell)
+                                .saturating_add(30 + rng.range(700) as u32);
+                        }
+                    }
+                    trips.push(RoutingTrip { stop_times });
+                }
+                patterns.push(RoutingPattern {
+                    line: LineIndex(line as u32),
+                    stops,
+                    trips,
+                });
+            }
+        }
+        let transfer_count = rng.range(station_count * 3 + 1);
+        let mut transfers = Vec::with_capacity(transfer_count);
+        for _ in 0..transfer_count {
+            let from = rng.range(station_count);
+            let mut to = rng.range(station_count);
+            if to == from {
+                to = (to + 1) % station_count;
+            }
+            transfers.push(RoutingTransfer {
+                from: StationIndex(from as u32),
+                to: StationIndex(to as u32),
+                seconds: rng.range(360) as u32,
+            });
+        }
+        RoutingData {
+            station_count,
+            line_count,
+            patterns,
+            transfers,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assert_matches_oracle(
+        router: &Router,
+        origin: StationIndex,
+        departure: u32,
+        disabled_lines: &LineMask,
+        closed_station: Option<StationIndex>,
+        frequency_multipliers: Option<&[f32]>,
+        actual: OneToAllResult,
+        context: &str,
+    ) {
+        let expected = exhaustive_one_to_all(
+            &router.data,
+            &router.config,
+            origin,
+            departure,
+            disabled_lines,
+            closed_station,
+            frequency_multipliers,
+        );
+        assert_eq!(
+            actual.arrival_seconds, expected.arrival_seconds,
+            "{context}: arrival times differ"
+        );
+        assert_eq!(
+            actual.transfers, expected.transfers,
+            "{context}: transfer counts differ"
+        );
+    }
+
+    #[test]
+    fn marked_route_scan_matches_exhaustive_oracle_on_generated_networks() {
+        for seed in 0..100_u64 {
+            let data = generated_routing_data(seed);
+            let router = Router::new(
+                data,
+                RouterConfig {
+                    maximum_transfers: (seed % 4) as u8,
+                    maximum_journey_seconds: 45 * 60 + (seed as u32 % 4) * 15 * 60,
+                },
+            );
+            let origins = (0..router.data.station_count.min(5))
+                .map(|station| StationIndex(station as u32))
+                .collect::<Vec<_>>();
+            let departures = [86_400, 90_000, 96_000];
+            for origin in origins {
+                for departure in departures {
+                    let empty = LineMask::empty(router.data.line_count);
+                    assert_matches_oracle(
+                        &router,
+                        origin,
+                        departure,
+                        &empty,
+                        None,
+                        None,
+                        router.one_to_all(origin, departure, &empty),
+                        &format!(
+                            "seed {seed}, origin {}, departure {departure}, intact",
+                            origin.0
+                        ),
+                    );
+
+                    let disabled_line =
+                        LineIndex(((seed as usize) % router.data.line_count) as u32);
+                    let disabled = LineMask::single(router.data.line_count, disabled_line);
+                    assert_matches_oracle(
+                        &router,
+                        origin,
+                        departure,
+                        &disabled,
+                        None,
+                        None,
+                        router.one_to_all(origin, departure, &disabled),
+                        &format!(
+                            "seed {seed}, origin {}, departure {departure}, disabled",
+                            origin.0
+                        ),
+                    );
+
+                    let closed_station =
+                        StationIndex(((seed as usize + 1) % router.data.station_count) as u32);
+                    assert_matches_oracle(
+                        &router,
+                        origin,
+                        departure,
+                        &empty,
+                        Some(closed_station),
+                        None,
+                        router.one_to_all_intervention(
+                            origin,
+                            departure,
+                            &Intervention::CloseStation(closed_station),
+                        ),
+                        &format!(
+                            "seed {seed}, origin {}, departure {departure}, closed",
+                            origin.0
+                        ),
+                    );
+
+                    let frequency_line =
+                        LineIndex(((seed as usize + 1) % router.data.line_count) as u32);
+                    let mut multipliers = vec![1.0_f32; router.data.line_count];
+                    multipliers[frequency_line.0 as usize] = 0.5;
+                    assert_matches_oracle(
+                        &router,
+                        origin,
+                        departure,
+                        &empty,
+                        None,
+                        Some(&multipliers),
+                        router.one_to_all_intervention(
+                            origin,
+                            departure,
+                            &Intervention::ScaleLineFrequency {
+                                line: frequency_line,
+                                multiplier: 0.5,
+                            },
+                        ),
+                        &format!(
+                            "seed {seed}, origin {}, departure {departure}, frequency",
+                            origin.0
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn boarding_does_not_move_arrival_time_backward() {
+        let data = RoutingData {
+            station_count: 4,
+            line_count: 1,
+            patterns: vec![RoutingPattern {
+                line: LineIndex(0),
+                stops: vec![StationIndex(1), StationIndex(2)],
+                trips: vec![trip(&[(90, 110), (200, 200)])],
+            }],
+            transfers: vec![
+                RoutingTransfer {
+                    from: StationIndex(0),
+                    to: StationIndex(1),
+                    seconds: 100,
+                },
+                RoutingTransfer {
+                    from: StationIndex(1),
+                    to: StationIndex(3),
+                    seconds: 20,
+                },
+            ],
+        };
+        let router = Router::new(
+            data,
+            RouterConfig {
+                maximum_transfers: 0,
+                ..RouterConfig::default()
+            },
+        );
+
+        let result = router.one_to_all(StationIndex(0), 0, &LineMask::empty(1));
+
+        assert_eq!(result.arrival_seconds[1], 100);
+        assert_eq!(result.arrival_seconds[2], 200);
+        assert_eq!(result.arrival_seconds[3], 120);
+    }
+
+    #[test]
+    fn downstream_boarding_can_replace_an_earlier_boarded_trip() {
+        let data = RoutingData {
+            station_count: 4,
+            line_count: 1,
+            patterns: vec![RoutingPattern {
+                line: LineIndex(0),
+                stops: vec![StationIndex(1), StationIndex(2), StationIndex(3)],
+                trips: vec![
+                    trip(&[(100, 100), (210, 220), (320, 320)]),
+                    trip(&[(160, 160), (170, 180), (230, 230)]),
+                ],
+            }],
+            transfers: vec![
+                RoutingTransfer {
+                    from: StationIndex(0),
+                    to: StationIndex(1),
+                    seconds: 0,
+                },
+                RoutingTransfer {
+                    from: StationIndex(0),
+                    to: StationIndex(2),
+                    seconds: 150,
+                },
+            ],
+        };
+        let router = Router::new(
+            data,
+            RouterConfig {
+                maximum_transfers: 0,
+                ..RouterConfig::default()
+            },
+        );
+
+        let result = router.one_to_all(StationIndex(0), 0, &LineMask::empty(1));
+
+        assert_eq!(result.arrival_seconds[2], 150);
+        assert_eq!(result.arrival_seconds[3], 230);
+    }
+
+    #[test]
+    fn boarding_and_alighting_restrictions_apply_at_the_current_stop() {
+        let pickup_blocked = Router::new(
+            RoutingData {
+                station_count: 3,
+                line_count: 1,
+                patterns: vec![RoutingPattern {
+                    line: LineIndex(0),
+                    stops: vec![StationIndex(0), StationIndex(1), StationIndex(2)],
+                    trips: vec![restricted_trip(&[
+                        (100, 100, 1, 0),
+                        (200, 200, 0, 0),
+                        (300, 300, 0, 0),
+                    ])],
+                }],
+                transfers: Vec::new(),
+            },
+            RouterConfig::default(),
+        );
+        let pickup_result = pickup_blocked.one_to_all(StationIndex(0), 90, &LineMask::empty(1));
+        assert_eq!(pickup_result.arrival_seconds[1], INF_TIME);
+        assert_eq!(pickup_result.arrival_seconds[2], INF_TIME);
+
+        let dropoff_blocked = Router::new(
+            RoutingData {
+                station_count: 3,
+                line_count: 1,
+                patterns: vec![RoutingPattern {
+                    line: LineIndex(0),
+                    stops: vec![StationIndex(0), StationIndex(1), StationIndex(2)],
+                    trips: vec![restricted_trip(&[
+                        (100, 100, 0, 0),
+                        (200, 200, 0, 1),
+                        (300, 300, 0, 0),
+                    ])],
+                }],
+                transfers: Vec::new(),
+            },
+            RouterConfig::default(),
+        );
+        let dropoff_result = dropoff_blocked.one_to_all(StationIndex(0), 90, &LineMask::empty(1));
+        assert_eq!(dropoff_result.arrival_seconds[1], INF_TIME);
+        assert_eq!(dropoff_result.arrival_seconds[2], 300);
     }
 
     #[test]

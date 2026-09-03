@@ -7,18 +7,13 @@ use std::time::{Duration, Instant};
 /// The small file-based control protocol keeps the training engine independent
 /// from SQLite, Bun, and an HTTP server. The worker owns the file and the
 /// trainer only reads it at safe optimizer-step boundaries.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DesiredTrainingState {
+    #[default]
     Running,
     Paused,
     Cancelled,
-}
-
-impl Default for DesiredTrainingState {
-    fn default() -> Self {
-        Self::Running
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

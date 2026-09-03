@@ -14,3 +14,5 @@ serde_json.workspace = true
 transit-domain = { path = "../transit-domain" }
 transit-router = { path = "../transit-router" }
 
+[dev-dependencies]
+tempfile.workspace = true

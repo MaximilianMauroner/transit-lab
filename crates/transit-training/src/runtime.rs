@@ -9,17 +9,14 @@ use transit_model::{MaskSelection, ReferenceRelationalAutoencoder};
 /// deliberately independent from a particular tensor backend so the same
 /// experiment can be inspected and benchmarked on a machine without
 /// LibTorch installed.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum DeviceKind {
+    #[default]
     Cpu,
-    Cuda { index: usize },
-}
-
-impl Default for DeviceKind {
-    fn default() -> Self {
-        Self::Cpu
-    }
+    Cuda {
+        index: usize,
+    },
 }
 
 impl std::fmt::Display for DeviceKind {
@@ -31,18 +28,13 @@ impl std::fmt::Display for DeviceKind {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum DTypeKind {
+    #[default]
     F32,
     F16,
     BF16,
-}
-
-impl Default for DTypeKind {
-    fn default() -> Self {
-        Self::F32
-    }
 }
 
 impl std::fmt::Display for DTypeKind {

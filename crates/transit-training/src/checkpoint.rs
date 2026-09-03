@@ -643,7 +643,7 @@ pub fn list_training_checkpoints(root: &Path) -> Result<Vec<PathBuf>> {
     // Directory enumeration order is not stable across filesystems. Sort the
     // candidates before validating them so reconciliation and fallback from a
     // stale latest pointer always choose the highest committed training step.
-    candidates.sort_by(|left, right| checkpoint_sort_key(left).cmp(&checkpoint_sort_key(right)));
+    candidates.sort_by_key(|path| checkpoint_sort_key(path));
     let mut checkpoints = Vec::new();
     for path in candidates {
         if load_training_checkpoint(&path).is_ok() {
@@ -693,7 +693,7 @@ fn checkpoint_payloads(checkpoint: &TrainingCheckpointV1) -> Result<Vec<(&'stati
 }
 
 fn encode_json<T: Serialize>(value: &T) -> Result<Vec<u8>> {
-    Ok(serde_json::to_vec_pretty(value).context("encoding checkpoint JSON")?)
+    serde_json::to_vec_pretty(value).context("encoding checkpoint JSON")
 }
 
 fn validate_manifest(manifest: &TrainingCheckpointManifest) -> Result<()> {
@@ -870,6 +870,13 @@ fn fingerprint_files(files: &[CheckpointFile]) -> String {
     sha256_hex(&encoded)
 }
 
+fn unix_timestamp_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -989,11 +996,4 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("run ID"));
     }
-}
-
-fn unix_timestamp_nanos() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default()
 }

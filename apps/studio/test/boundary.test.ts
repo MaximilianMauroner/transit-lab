@@ -118,6 +118,14 @@ test("dataset and evaluation runs use indexed immutable inputs", async () => {
   }));
   run(db, `INSERT INTO datasets(id, fingerprint, status, manifest_path, feature_schema, created_at, updated_at)
     VALUES ('dataset-1', 'dataset-fingerprint', 'ready', ?, 'station-line-relational-v2', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z')`, [datasetRoot + "/dataset-manifest.json"]);
+  const staleLabels = join(root, "data", "stale-labels.jsonl");
+  await writeFile(staleLabels, '{"snapshot":"snapshot-1","line":0}\n');
+  run(db, `INSERT INTO artifacts(id, kind, fingerprint, uri, local_path, metadata_json, created_at)
+    VALUES ('artifact-stale-labels', 'criticality-labels', 'stale-label-fingerprint', ?, ?, ?, '2026-09-02T00:00:00Z')`, [
+    staleLabels,
+    staleLabels,
+    JSON.stringify({ snapshotId: "snapshot-1" })
+  ]);
   const modelPath = join(datasetRoot, "model.json");
   await writeFile(modelPath, "model");
   run(db, `INSERT INTO artifacts(id, kind, fingerprint, uri, local_path, created_at)

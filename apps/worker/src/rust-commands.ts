@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { readFileSync, realpathSync, statSync } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
-import { validateTrainingCheckpointManifest } from "../../../packages/contracts/src/index.ts";
+import { ROUTER_ALGORITHM_VERSION, validateTrainingCheckpointManifest } from "../../../packages/contracts/src/index.ts";
 import { all, dataRoot, findTrainingCheckpointForRun, one, parseJson } from "../../../packages/control-store/src/database.ts";
 import { findSnapshot } from "../../../packages/control-store/src/inventory.ts";
 
@@ -93,22 +93,17 @@ function labelArtifactForSnapshot(db, root, snapshotId) {
     ORDER BY created_at DESC, id DESC`);
   for (const candidate of candidates) {
     const metadata = parseJson(candidate.metadata_json, {});
+    if (metadata.routerAlgorithmVersion !== ROUTER_ALGORITHM_VERSION &&
+        metadata.router_algorithm_version !== ROUTER_ALGORITHM_VERSION) continue;
     if (metadata.snapshotId !== snapshotId && metadata.snapshot_id !== snapshotId) continue;
-    const path = artifactPath(root, candidate);
-    if (path) return path;
-  }
-  // Older label artifacts did not carry snapshot metadata. Inspect their
-  // first JSONL row so a valid immutable artifact remains discoverable.
-  for (const candidate of candidates) {
     const path = artifactPath(root, candidate);
     if (!path) continue;
     try {
       const first = readFileSync(path, "utf8").split(/\r?\n/).find((line) => line.trim());
       const row = first ? JSON.parse(first) : null;
-      if (row?.snapshot === snapshotId || row?.snapshotId === snapshotId) return path;
+      if (row?.snapshot === snapshotId && row?.router_algorithm_version === ROUTER_ALGORITHM_VERSION) return path;
     } catch {
-      // The artifact boundary validator will report malformed output when it
-      // is indexed; it is not a candidate for this command in the meantime.
+      // A malformed or stale artifact is not a candidate for a dataset build.
     }
   }
   return null;

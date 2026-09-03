@@ -8,7 +8,8 @@ import {
   validateBenchmarkResult,
   validateDatasetManifest,
   validateEvaluationResult,
-  validateInferenceResult
+  validateInferenceResult,
+  ROUTER_ALGORITHM_VERSION
 } from "../../contracts/src/index.ts";
 import {
   all,
@@ -978,12 +979,15 @@ async function syncSnapshot(db, root, manifestPath, networkPath, knownRevisions)
 async function syncLabels(db, root, path, snapshotById) {
   const lines = (await Bun.file(path).text()).split(/\r?\n/).filter(Boolean);
   if (!lines.length) return;
-  const snapshotId = parseJson(lines[0], {})?.snapshot;
+  const first = parseJson(lines[0], {});
+  const snapshotId = first?.snapshot;
+  const routerAlgorithmVersion = first?.router_algorithm_version;
+  if (routerAlgorithmVersion !== ROUTER_ALGORITHM_VERSION) return;
   if (!snapshotId || !snapshotById.has(snapshotId)) return;
   const artifact = indexedArtifactForPath(db, root, path, ["criticality-labels"]) || await ensureArtifact(db, root, {
     kind: "criticality-labels",
     path,
-    metadata: { snapshotId, rows: lines.length }
+    metadata: { snapshotId, rows: lines.length, routerAlgorithmVersion }
   });
   for (const line of lines) {
     const label = parseJson(line, null);

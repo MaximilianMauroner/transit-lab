@@ -17,6 +17,8 @@ export const INFERENCE_RESULT_SCHEMA_VERSION = 1;
 export const EXPERIMENT_SPEC_SCHEMA_VERSION = 1;
 export const PUBLICATION_MANIFEST_SCHEMA_VERSION = 1;
 export const BENCHMARK_RESULT_SCHEMA_VERSION = 1;
+/** Must match transit-router::ROUTER_ALGORITHM_VERSION. */
+export const ROUTER_ALGORITHM_VERSION = "transit-router-v2";
 export const DEFAULT_MODEL_CONFIG = "configs/models/multitask-v1.yaml";
 
 export const RUNTIME_CONFIG_DEFAULTS = Object.freeze({

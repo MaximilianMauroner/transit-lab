@@ -347,7 +347,10 @@ fn mode_matches(route_type: Option<&str>, wanted: &str) -> bool {
     mode == wanted || (wanted == "rail" && mode == "suburban_rail")
 }
 
-fn parse_geojson_polygons(bytes: &[u8]) -> Result<Vec<Vec<Vec<(f64, f64)>>>> {
+type Polygon = Vec<Vec<(f64, f64)>>;
+type Polygons = Vec<Polygon>;
+
+fn parse_geojson_polygons(bytes: &[u8]) -> Result<Polygons> {
     let value: serde_json::Value =
         serde_json::from_slice(bytes).context("decoding scope GeoJSON")?;
     let mut output = Vec::new();
@@ -355,10 +358,7 @@ fn parse_geojson_polygons(bytes: &[u8]) -> Result<Vec<Vec<Vec<(f64, f64)>>>> {
     Ok(output)
 }
 
-fn collect_geojson_polygons(
-    value: &serde_json::Value,
-    output: &mut Vec<Vec<Vec<(f64, f64)>>>,
-) -> Result<()> {
+fn collect_geojson_polygons(value: &serde_json::Value, output: &mut Polygons) -> Result<()> {
     match value.get("type").and_then(serde_json::Value::as_str) {
         Some("FeatureCollection") => {
             for feature in value

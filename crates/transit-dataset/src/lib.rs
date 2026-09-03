@@ -8,7 +8,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use transit_domain::{hex_digest, sha256_bytes, CompiledNetwork};
 use transit_graph::GraphTensor;
-use transit_labels::{load_jsonl, save_jsonl, LineImpactLabel};
+use transit_labels::{load_jsonl, save_jsonl, LineImpactLabel, ROUTER_ALGORITHM_VERSION};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DatasetManifest {
@@ -441,6 +441,16 @@ fn validate_label_rows(
         if label.snapshot != snapshot_id {
             anyhow::bail!("{field} contains labels from a different snapshot");
         }
+        if label.router_algorithm_version != ROUTER_ALGORITHM_VERSION {
+            anyhow::bail!(
+                "{field} contains labels generated with router {}; expected {}",
+                label.router_algorithm_version,
+                ROUTER_ALGORITHM_VERSION
+            );
+        }
+        if label.policy_fingerprint.trim().is_empty() {
+            anyhow::bail!("{field} contains a label without a policy fingerprint");
+        }
         if label.line.0 as usize >= line_count {
             anyhow::bail!("{field} contains a line outside graph {snapshot_id}");
         }
@@ -548,19 +558,14 @@ fn load_manifest(directory: &Path) -> Result<DatasetManifest> {
 fn load_dataset_entry(
     directory: &Path,
     manifest: &DatasetManifest,
-    snapshot_id: &str,
-    graph_directory: &str,
-    label_file: &str,
-    label_count: usize,
-    split: &str,
-    network_system_id: &str,
+    entry: &DatasetEntry,
 ) -> Result<LoadedDataset> {
-    validate_split(split, "dataset entry split")?;
-    let graph_path = dataset_path(directory, graph_directory, "graphDirectory")?;
+    validate_split(&entry.split, "dataset entry split")?;
+    let graph_path = dataset_path(directory, &entry.graph_directory, "graphDirectory")?;
     if !graph_path.is_dir() {
         anyhow::bail!("dataset graph directory is not a directory");
     }
-    let label_path = dataset_path(directory, label_file, "labelFile")?;
+    let label_path = dataset_path(directory, &entry.label_file, "labelFile")?;
     if !label_path.is_file() {
         anyhow::bail!("dataset label file is not a file");
     }
@@ -568,36 +573,38 @@ fn load_dataset_entry(
         .with_context(|| format!("loading dataset graph {}", graph_path.display()))?;
     let labels = load_jsonl(&label_path)
         .with_context(|| format!("loading dataset labels {}", label_path.display()))?;
-    if graph.manifest.snapshot_id != snapshot_id {
+    if graph.manifest.snapshot_id != entry.snapshot_id {
         anyhow::bail!("dataset entry and graph have different snapshot IDs");
     }
     if graph.manifest.schema_version != manifest.feature_schema {
         anyhow::bail!("dataset graph and manifest have different feature schemas");
     }
-    if !network_system_id.is_empty() && network_system_id != graph.manifest.network_system_id {
+    if !entry.network_system_id.is_empty()
+        && entry.network_system_id != graph.manifest.network_system_id
+    {
         anyhow::bail!("dataset entry network system does not match its graph");
     }
-    if labels.len() != label_count {
+    if labels.len() != entry.label_count {
         anyhow::bail!("dataset entry label count does not match its label file");
     }
     validate_label_rows(
         &labels,
-        snapshot_id,
+        &entry.snapshot_id,
         graph.manifest.line_count,
         "dataset labels",
     )?;
     let graph_network_system_id = graph.manifest.network_system_id.clone();
-    let network_system_id = if network_system_id.is_empty() {
+    let network_system_id = if entry.network_system_id.is_empty() {
         graph_network_system_id
     } else {
-        network_system_id.to_owned()
+        entry.network_system_id.clone()
     };
     Ok(LoadedDataset {
         manifest: manifest.clone(),
         graph,
         labels,
         network_system_id,
-        split: split.to_owned(),
+        split: entry.split.clone(),
     })
 }
 
@@ -717,16 +724,7 @@ fn load_dataset_collection_filtered(
         Some(split) => entry.split == split.as_str(),
         None => true,
     }) {
-        let loaded = load_dataset_entry(
-            directory,
-            &manifest,
-            &entry.snapshot_id,
-            &entry.graph_directory,
-            &entry.label_file,
-            entry.label_count,
-            &entry.split,
-            &entry.network_system_id,
-        )?;
+        let loaded = load_dataset_entry(directory, &manifest, entry)?;
         graph_pairs.push((entry.snapshot_id.clone(), loaded.graph.clone()));
         entries.push(loaded);
     }
@@ -799,6 +797,7 @@ mod tests {
                 mean_extra_transfers: 0.0,
                 stations_losing_all_service_share: 0.0,
                 query_count: 1,
+                router_algorithm_version: ROUTER_ALGORITHM_VERSION.into(),
                 policy_fingerprint: "policy".into(),
             })
             .collect()

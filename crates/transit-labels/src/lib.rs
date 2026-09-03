@@ -7,10 +7,12 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use transit_domain::{hex_digest, sha256_bytes, LineIndex, StationIndex, INF_TIME};
+pub use transit_router::ROUTER_ALGORITHM_VERSION;
 use transit_router::{OneToAllResult, Router, RouterConfig};
 
-pub const ROUTING_BASELINE_SCHEMA_VERSION: &str = "routing-baseline-v1";
-pub const LABEL_BATCH_SCHEMA_VERSION: &str = "label-batch-v1";
+pub const ROUTING_BASELINE_SCHEMA_VERSION: &str = "routing-baseline-v2";
+pub const LABEL_MANIFEST_SCHEMA_VERSION: &str = "line-impact-labels-v2";
+pub const LABEL_BATCH_SCHEMA_VERSION: &str = "label-batch-v2";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LabelGenerationConfig {
@@ -50,6 +52,7 @@ pub struct OriginCandidate {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LabelManifest {
     pub schema_version: String,
+    pub router_algorithm_version: String,
     pub policy_fingerprint: String,
     pub config: LabelGenerationConfig,
     pub origin_count: usize,
@@ -63,6 +66,7 @@ pub struct LabelManifest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LabelBatchManifest {
     pub schema_version: String,
+    pub router_algorithm_version: String,
     pub snapshot_id: String,
     pub policy_fingerprint: String,
     pub config: LabelGenerationConfig,
@@ -76,7 +80,11 @@ pub struct LabelBatchManifest {
 }
 
 pub fn label_policy_fingerprint(config: &LabelGenerationConfig) -> String {
-    let encoded = serde_json::to_vec(config).expect("label configuration is serializable");
+    let value = serde_json::json!({
+        "router_algorithm_version": ROUTER_ALGORITHM_VERSION,
+        "config": config,
+    });
+    let encoded = serde_json::to_vec(&value).expect("label configuration is serializable");
     hex_digest(&sha256_bytes(&encoded))
 }
 
@@ -106,6 +114,11 @@ pub struct LineImpactLabel {
     /// only by the removed line.
     pub stations_losing_all_service_share: f32,
     pub query_count: u32,
+    /// Identifies the routing semantics used to produce this row. A missing
+    /// value is retained during deserialization only so validation can report
+    /// that an old artifact is incompatible.
+    #[serde(default)]
+    pub router_algorithm_version: String,
     /// Identifies the exact label policy, including origin sampling, used to
     /// produce this row. Older JSONL files deserialize to an empty value.
     #[serde(default)]
@@ -122,6 +135,7 @@ pub struct RoutingBaselineQuery {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RoutingBaseline {
     pub schema_version: String,
+    pub router_algorithm_version: String,
     pub snapshot_id: String,
     pub origins: Vec<StationIndex>,
     pub departures: Vec<u32>,
@@ -137,6 +151,13 @@ impl RoutingBaseline {
                 "unsupported routing baseline schema {}; expected {}",
                 self.schema_version,
                 ROUTING_BASELINE_SCHEMA_VERSION
+            );
+        }
+        if self.router_algorithm_version != ROUTER_ALGORITHM_VERSION {
+            anyhow::bail!(
+                "routing baseline was generated with router {}; expected {}",
+                self.router_algorithm_version,
+                ROUTER_ALGORITHM_VERSION
             );
         }
         if self.router_config.maximum_transfers != router.config.maximum_transfers
@@ -193,6 +214,7 @@ pub fn build_routing_baseline(
     let snapshot_id = snapshot.into();
     let mut baseline = RoutingBaseline {
         schema_version: ROUTING_BASELINE_SCHEMA_VERSION.into(),
+        router_algorithm_version: ROUTER_ALGORITHM_VERSION.into(),
         snapshot_id,
         origins,
         departures,
@@ -393,6 +415,7 @@ pub fn generate_selected_line_removal_labels_from_baseline(
                         / extra_transfer_count.max(1) as f32,
                     stations_losing_all_service_share,
                     query_count: baseline.queries.len() as u32,
+                    router_algorithm_version: ROUTER_ALGORITHM_VERSION.into(),
                     policy_fingerprint: policy_fingerprint.clone(),
                 }
             },
@@ -466,7 +489,7 @@ pub fn sample_origins(
         .filter(|candidate| candidate.latitude.is_finite() && candidate.longitude.is_finite())
         .cloned()
         .collect();
-    candidates.sort_by(|left, right| stable_candidate_key(left).cmp(&stable_candidate_key(right)));
+    candidates.sort_by_key(stable_candidate_key);
     candidates.dedup_by_key(|candidate| candidate.index);
     if candidates.len() <= maximum {
         return candidates
@@ -526,11 +549,11 @@ pub fn sample_origins(
     selected
 }
 
-fn geographic_order<'a>(
-    candidates: &'a [OriginCandidate],
+fn geographic_order(
+    candidates: &[OriginCandidate],
     maximum: usize,
     seed: u64,
-) -> Vec<&'a OriginCandidate> {
+) -> Vec<&OriginCandidate> {
     if maximum == 0 || candidates.is_empty() {
         return Vec::new();
     }
@@ -604,6 +627,9 @@ fn count_within(result: &OneToAllResult, departure: u32, threshold: u32) -> usiz
 }
 
 pub fn save_jsonl(path: &Path, labels: &[LineImpactLabel]) -> Result<()> {
+    for (index, label) in labels.iter().enumerate() {
+        validate_label_identity(label, &format!("label row {}", index + 1))?;
+    }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
@@ -639,7 +665,8 @@ pub fn save_label_manifest_with_metadata(
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
     let manifest = LabelManifest {
-        schema_version: "line-impact-labels-v1".into(),
+        schema_version: LABEL_MANIFEST_SCHEMA_VERSION.into(),
+        router_algorithm_version: ROUTER_ALGORITHM_VERSION.into(),
         policy_fingerprint: label_policy_fingerprint(config),
         config: config.clone(),
         origin_count,
@@ -666,6 +693,13 @@ fn label_batch_manifest_path(path: &Path) -> std::path::PathBuf {
 pub fn save_label_batch_manifest(path: &Path, manifest: &LabelBatchManifest) -> Result<()> {
     if manifest.schema_version != LABEL_BATCH_SCHEMA_VERSION {
         anyhow::bail!("unsupported label batch schema {}", manifest.schema_version);
+    }
+    if manifest.router_algorithm_version != ROUTER_ALGORITHM_VERSION {
+        anyhow::bail!(
+            "label batch was generated with router {}; expected {}",
+            manifest.router_algorithm_version,
+            ROUTER_ALGORITHM_VERSION
+        );
     }
     if manifest.snapshot_id.trim().is_empty()
         || manifest.baseline_fingerprint.trim().is_empty()
@@ -715,6 +749,13 @@ pub fn load_label_batch_manifest(path: &Path) -> Result<LabelBatchManifest> {
             LABEL_BATCH_SCHEMA_VERSION
         );
     }
+    if manifest.router_algorithm_version != ROUTER_ALGORITHM_VERSION {
+        anyhow::bail!(
+            "label batch was generated with router {}; expected {}",
+            manifest.router_algorithm_version,
+            ROUTER_ALGORITHM_VERSION
+        );
+    }
     Ok(manifest)
 }
 
@@ -753,6 +794,7 @@ pub fn generate_line_removal_labels_resumable(
         new_label_batch_manifest(snapshot.clone(), config, baseline, router.data.line_count)
     };
     if manifest.snapshot_id != snapshot
+        || manifest.router_algorithm_version != ROUTER_ALGORITHM_VERSION
         || manifest.policy_fingerprint != policy_fingerprint
         || manifest.baseline_fingerprint != baseline_fingerprint
         || manifest.origins != baseline.origins
@@ -837,6 +879,7 @@ fn new_label_batch_manifest(
 ) -> LabelBatchManifest {
     LabelBatchManifest {
         schema_version: LABEL_BATCH_SCHEMA_VERSION.into(),
+        router_algorithm_version: ROUTER_ALGORITHM_VERSION.into(),
         snapshot_id: snapshot,
         policy_fingerprint: label_policy_fingerprint(config),
         config: config.clone(),
@@ -861,12 +904,36 @@ fn validate_partial_labels(
         if row.snapshot != snapshot {
             anyhow::bail!("partial label output contains a different snapshot");
         }
-        if !row.policy_fingerprint.is_empty() && row.policy_fingerprint != policy_fingerprint {
+        if row.router_algorithm_version != ROUTER_ALGORITHM_VERSION {
+            anyhow::bail!(
+                "partial label output was generated with router {}; expected {}",
+                row.router_algorithm_version,
+                ROUTER_ALGORITHM_VERSION
+            );
+        }
+        if row.policy_fingerprint.is_empty() {
+            anyhow::bail!("partial label output is missing its label policy fingerprint");
+        }
+        if row.policy_fingerprint != policy_fingerprint {
             anyhow::bail!("partial label output contains a different label policy");
         }
         if row.line.0 as usize >= line_count || !seen.insert(row.line) {
             anyhow::bail!("partial label output contains a duplicate or invalid line");
         }
+    }
+    Ok(())
+}
+
+fn validate_label_identity(label: &LineImpactLabel, field: &str) -> Result<()> {
+    if label.router_algorithm_version != ROUTER_ALGORITHM_VERSION {
+        anyhow::bail!(
+            "{field} was generated with router {}; expected {}",
+            label.router_algorithm_version,
+            ROUTER_ALGORITHM_VERSION
+        );
+    }
+    if label.policy_fingerprint.trim().is_empty() {
+        anyhow::bail!("{field} is missing its label policy fingerprint");
     }
     Ok(())
 }
@@ -879,10 +946,10 @@ pub fn load_jsonl(path: &Path) -> Result<Vec<LineImpactLabel>> {
         if line.trim().is_empty() {
             continue;
         }
-        labels.push(
-            serde_json::from_str(&line)
-                .with_context(|| format!("decoding label line {}", line_number + 1))?,
-        );
+        let label: LineImpactLabel = serde_json::from_str(&line)
+            .with_context(|| format!("decoding label line {}", line_number + 1))?;
+        validate_label_identity(&label, &format!("label line {}", line_number + 1))?;
+        labels.push(label);
     }
     Ok(labels)
 }
@@ -970,6 +1037,8 @@ fn discounted_gain(order: &[usize], target: &[f32], k: usize) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::tempdir;
     use transit_domain::StopTime;
     use transit_router::{RouterConfig, RoutingData, RoutingPattern, RoutingTrip};
 
@@ -1143,6 +1212,116 @@ mod tests {
             labels[0].policy_fingerprint,
             label_policy_fingerprint(&config)
         );
+        assert_eq!(labels[0].router_algorithm_version, ROUTER_ALGORITHM_VERSION);
+    }
+
+    #[test]
+    fn persisted_routing_artifacts_carry_router_version_metadata() {
+        let router = Router::new(
+            RoutingData {
+                station_count: 2,
+                line_count: 1,
+                patterns: vec![RoutingPattern {
+                    line: LineIndex(0),
+                    stops: vec![StationIndex(0), StationIndex(1)],
+                    trips: vec![trip()],
+                }],
+                transfers: Vec::new(),
+            },
+            RouterConfig::default(),
+        );
+        let directory = tempdir().unwrap();
+        let baseline = build_routing_baseline(&router, "snapshot", &[StationIndex(0)], &[90]);
+        let baseline_path = directory.path().join("routing-baseline.json");
+        save_routing_baseline(&baseline_path, &baseline).unwrap();
+        let baseline_json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&baseline_path).unwrap()).unwrap();
+        assert_eq!(
+            baseline_json["router_algorithm_version"],
+            ROUTER_ALGORITHM_VERSION
+        );
+
+        let config = LabelGenerationConfig::default();
+        let labels = generate_selected_line_removal_labels_from_baseline(
+            &router,
+            "snapshot",
+            &config,
+            &[LineIndex(0)],
+            &baseline,
+        );
+        let labels_path = directory.path().join("labels.jsonl");
+        save_jsonl(&labels_path, &labels).unwrap();
+        let row: serde_json::Value = serde_json::from_str(
+            fs::read_to_string(&labels_path)
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(row["router_algorithm_version"], ROUTER_ALGORITHM_VERSION);
+
+        save_label_manifest_with_metadata(
+            &labels_path,
+            &config,
+            baseline.origins.len(),
+            "snapshot",
+            &baseline.departures,
+        )
+        .unwrap();
+        let manifest: LabelManifest = serde_json::from_slice(
+            &fs::read(directory.path().join("labels.manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest.schema_version, LABEL_MANIFEST_SCHEMA_VERSION);
+        assert_eq!(manifest.router_algorithm_version, ROUTER_ALGORITHM_VERSION);
+        assert_eq!(
+            manifest.policy_fingerprint,
+            label_policy_fingerprint(&config)
+        );
+
+        let batch = LabelBatchManifest {
+            schema_version: LABEL_BATCH_SCHEMA_VERSION.into(),
+            router_algorithm_version: ROUTER_ALGORITHM_VERSION.into(),
+            snapshot_id: "snapshot".into(),
+            policy_fingerprint: label_policy_fingerprint(&config),
+            config,
+            origins: baseline.origins.clone(),
+            departure_times_seconds: baseline.departures.clone(),
+            router_config: baseline.router_config.clone(),
+            baseline_fingerprint: baseline.fingerprint.clone(),
+            line_count: router.data.line_count,
+            completed_lines: vec![LineIndex(0)],
+            status: "committed".into(),
+        };
+        save_label_batch_manifest(&labels_path, &batch).unwrap();
+        assert_eq!(
+            load_label_batch_manifest(&labels_path)
+                .unwrap()
+                .router_algorithm_version,
+            ROUTER_ALGORITHM_VERSION
+        );
+    }
+
+    #[test]
+    fn legacy_label_rows_fail_identity_validation() {
+        let legacy: LineImpactLabel = serde_json::from_value(serde_json::json!({
+            "snapshot": "snapshot",
+            "line": 0,
+            "accessibility_auc_loss": 0.0,
+            "unreachable_share": 0.0,
+            "mean_delay_reachable_seconds": 0.0,
+            "p95_delay_reachable_seconds": 0.0,
+            "mean_extra_transfers": 0.0,
+            "stations_losing_all_service_share": 0.0,
+            "query_count": 1
+        }))
+        .unwrap();
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("legacy-labels.jsonl");
+        fs::write(&path, serde_json::to_string(&legacy).unwrap() + "\n").unwrap();
+        let error = load_jsonl(&path).unwrap_err();
+        assert!(error.to_string().contains("router"));
     }
 
     #[test]

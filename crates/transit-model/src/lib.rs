@@ -473,9 +473,13 @@ impl ReferenceRelationalAutoencoder {
             if !mask.station_rows[row] {
                 continue;
             }
-            for output in 0..graph.station_features.cols {
+            for (output, bias) in station_bias
+                .iter()
+                .enumerate()
+                .take(graph.station_features.cols)
+            {
                 let offset = output * self.config.hidden_dimension;
-                let prediction = station_bias[output]
+                let prediction = *bias
                     + station_weights[offset..offset + self.config.hidden_dimension]
                         .iter()
                         .zip(embedding)
@@ -507,9 +511,9 @@ impl ReferenceRelationalAutoencoder {
             if !mask.line_rows[row] {
                 continue;
             }
-            for output in 0..graph.line_features.cols {
+            for (output, bias) in line_bias.iter().enumerate().take(graph.line_features.cols) {
                 let offset = output * self.config.hidden_dimension;
-                let prediction = line_bias[output]
+                let prediction = *bias
                     + line_weights[offset..offset + self.config.hidden_dimension]
                         .iter()
                         .zip(embedding)
@@ -756,7 +760,7 @@ fn encode_pattern_sequences(
             } else {
                 &[]
             };
-            for hidden_index in 0..hidden {
+            for (hidden_index, state_value) in state.iter_mut().enumerate() {
                 let station_component = station_value
                     .and_then(|values| values.get(hidden_index))
                     .copied()
@@ -775,7 +779,7 @@ fn encode_pattern_sequences(
                 let line_component = line[line_index].get(hidden_index).copied().unwrap_or(0.0);
                 let position_component =
                     (position - start) as f32 / (end - start - 1).max(1) as f32;
-                state[hidden_index] = (state[hidden_index] * 0.58
+                *state_value = (*state_value * 0.58
                     + station_component * 0.34
                     + segment_component * 0.08
                     + stop_component * 0.03
@@ -1229,6 +1233,7 @@ mod tests {
                     mean_extra_transfers: 999.0,
                     stations_losing_all_service_share: 999.0,
                     query_count: 1,
+                    router_algorithm_version: transit_labels::ROUTER_ALGORITHM_VERSION.into(),
                     policy_fingerprint: String::new(),
                 }],
             )

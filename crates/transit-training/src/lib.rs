@@ -1438,7 +1438,7 @@ mod tests {
 
     #[test]
     fn unrelated_same_named_lines_are_not_identity_positives() {
-        let samples = vec![
+        let samples = [
             sample("vienna|scope", "snapshot-a", Some("line:agency:1"), 0.0),
             // This is intentionally closest in the engineered feature space,
             // but belongs to another transport system.
@@ -1456,7 +1456,7 @@ mod tests {
 
     #[test]
     fn missing_system_identity_does_not_create_a_false_positive() {
-        let samples = vec![
+        let samples = [
             sample("", "snapshot-a", Some("line:1"), 0.0),
             sample("", "snapshot-b", Some("line:1"), 0.1),
             sample("", "snapshot-c", Some("line:2"), 0.2),

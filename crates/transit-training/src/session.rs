@@ -405,6 +405,7 @@ fn phase_model(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn save_multitask_phase_checkpoint(
     session: &ReferenceTrainingSession,
     checkpoint_root: &Path,
@@ -448,6 +449,7 @@ fn checkpoint_due(
             .is_some_and(|value| last_checkpoint_at.elapsed() >= Duration::from_secs(value))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn multitask_report(
     pretraining: &TrainingReport,
     dataset_count: usize,
@@ -477,6 +479,7 @@ fn multitask_report(
 /// Every later-phase checkpoint is committed after a complete epoch, so a
 /// resumed process starts at the next epoch with the same deterministic
 /// examples and optimizer metadata.
+#[allow(clippy::too_many_arguments)]
 pub fn run_reference_multitask_with_policy_options(
     datasets: &[(&GraphTensor, &[LineImpactLabel])],
     config: &MultiTaskTrainingConfig,
@@ -740,9 +743,9 @@ pub fn run_reference_multitask_with_policy_options(
         observer.epoch_started("metric-learning", epoch + 1, config.metric_epochs);
         let (loss, _) =
             crate::fit_metric_epoch(&mut representation, &samples, &metric_plan, config)?;
-        if epoch == 0 && phase_from_checkpoint != "metric-learning" {
-            metric_initial_loss = loss;
-        } else if phase_state.metric_initial_loss.is_none() && epoch == metric_start_epoch {
+        if (epoch == 0 && phase_from_checkpoint != "metric-learning")
+            || (phase_state.metric_initial_loss.is_none() && epoch == metric_start_epoch)
+        {
             metric_initial_loss = loss;
         }
         metric_final_loss = loss;
@@ -982,9 +985,9 @@ pub fn run_reference_multitask_with_policy_options(
         for epoch in criticality_start_epoch..config.criticality.epochs {
             observer.epoch_started("criticality", epoch + 1, config.criticality.epochs);
             let loss = crate::fit_criticality_epoch(&mut head, &examples, &config.criticality)?;
-            if epoch == 0 && phase_from_checkpoint != "criticality" {
-                criticality_initial_loss = loss;
-            } else if criticality_report.is_none() && epoch == criticality_start_epoch {
+            if (epoch == 0 && phase_from_checkpoint != "criticality")
+                || (criticality_report.is_none() && epoch == criticality_start_epoch)
+            {
                 criticality_initial_loss = loss;
             }
             criticality_final_loss = loss;
@@ -1154,6 +1157,7 @@ pub fn run_reference_multitask_with_policy_options(
 /// Run the reference pretraining phase as a resumable logical execution. The
 /// process can exit after this function returns; all model and cursor state is
 /// already in the committed checkpoint directory.
+#[allow(clippy::too_many_arguments)]
 pub fn run_reference_pretraining(
     graph: &GraphTensor,
     config: &PretrainingConfig,
@@ -1179,6 +1183,7 @@ pub fn run_reference_pretraining(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_reference_pretraining_with_policy(
     graph: &GraphTensor,
     config: &PretrainingConfig,
@@ -1202,6 +1207,7 @@ pub fn run_reference_pretraining_with_policy(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_reference_pretraining_with_policy_options(
     graph: &GraphTensor,
     config: &PretrainingConfig,
@@ -1230,6 +1236,7 @@ pub fn run_reference_pretraining_with_policy_options(
 /// A checkpoint stores the graph order and next graph cursor, making a pause
 /// or worker restart transparent even when the dataset contains several city
 /// systems.
+#[allow(clippy::too_many_arguments)]
 pub fn run_reference_pretraining_multi_with_policy_options(
     graphs: &[&GraphTensor],
     config: &PretrainingConfig,
@@ -1381,6 +1388,7 @@ pub fn run_reference_pretraining_multi_with_policy_options(
 }
 
 /// Quiet convenience wrapper for balanced multi-city pretraining.
+#[allow(clippy::too_many_arguments)]
 pub fn run_reference_pretraining_multi_with_policy(
     graphs: &[&GraphTensor],
     config: &PretrainingConfig,
@@ -1539,6 +1547,7 @@ mod tests {
                 mean_extra_transfers: 0.1 + line as f32 * 0.03,
                 stations_losing_all_service_share: 0.05 + line as f32 * 0.01,
                 query_count: 8,
+                router_algorithm_version: transit_labels::ROUTER_ALGORITHM_VERSION.into(),
                 policy_fingerprint: "test-policy".into(),
             })
             .collect()
